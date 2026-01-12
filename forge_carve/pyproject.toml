@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge-carve"
+version = "0.1.0"
+description = "FORGE++-CARVE MVP"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "torch",
+  "pydantic>=2.5",
+  "jsonschema",
+  "numpy<2",
+  "PyYAML",
+  "typer",
+  "rich",
+  "pytest",
+  "faiss-gpu>=1.7.2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

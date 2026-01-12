@@ -1,0 +1,16 @@
+backbone:
+  d_model: 64
+  n_heads: 2
+  n_layers: 2
+  d_ff: 128
+  dropout: 0.1
+  max_len: 64
+slots:
+  num_slots: 4
+  d_slot: 64
+  num_states: 4
+primal_dual:
+  num_constraints: 7
+  steps: 2
+  d_slot: 64
+max_prog_len: 64
