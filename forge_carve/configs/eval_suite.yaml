@@ -3,3 +3,5 @@ schema_path: out/data/schema.jsonl
 math_path: out/data/math.jsonl
 csp_path: out/data/csp.jsonl
 out_path: out/report.json
+parallel_orbits: true
+log_every: 50

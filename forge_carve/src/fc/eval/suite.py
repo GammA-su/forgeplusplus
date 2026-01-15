@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -8,12 +9,14 @@ import torch
 import yaml
 
 from fc.adv.mutator import ProgramMutator
-from fc.dsl.codec import alignment_distance, decode_program
+from fc.dsl.codec import decode_program
 from fc.dsl.program import Program
 from fc.eval.metrics import (
     attack_success_rate,
     flip_sensitivity_score,
+    flip_output_pass,
     orbit_invariance_pass_rate,
+    orbit_output_pass,
     proof_validity_correlation,
     repair_success_rate,
     selective_accuracy,
@@ -24,9 +27,7 @@ from fc.morph.equiv import outputs_equivalent
 from fc.dsl.tokens import TokenVocab
 from fc.train.data import Example, TextVocab
 from fc.util.jsonl import read_jsonl
-from fc.verify.mesh import VerifierMesh
-from fc.dsl.repair import propose_repairs
-from fc.train.losses import kl_divergence
+from fc.verify.mesh import VerifierMesh, set_orbit_parallelism
 
 
 def _load_text_vocab(mapping: dict[str, int]) -> TextVocab:
@@ -43,7 +44,9 @@ def run_eval(
     ckpt_path: str,
     out_path: str,
     device: str | torch.device | None = None,
+    log_every: int = 50,
 ) -> dict[str, Any]:
+    logger = logging.getLogger(__name__)
     rows = [Example.model_validate(r) for r in read_jsonl(data_path)]
     ckpt = torch.load(ckpt_path, map_location="cpu")
     text_vocab = _load_text_vocab(ckpt["text_vocab"])
@@ -91,7 +94,10 @@ def run_eval(
     adv_success = 0
     adv_total = 0
 
-    for ex in rows:
+    total = len(rows)
+    for idx, ex in enumerate(rows):
+        if log_every > 0 and (idx % log_every == 0 or idx + 1 == total):
+            logger.info("eval progress=%d/%d data=%s", idx + 1, total, data_path)
         input_ids = torch.tensor(
             [text_vocab.encode(ex.x, cfg["train"]["max_text_len"])],
             dtype=torch.long,
@@ -130,8 +136,7 @@ def run_eval(
         )
         valid.append(formal_ok)
 
-        # Internal invariance: mu + program skeleton stability across orbits
-        orbit_ok = True
+        orbit_execs = []
         for otext in orbits:
             orbit_ids = torch.tensor(
                 [text_vocab.encode(otext, cfg["train"]["max_text_len"])],
@@ -143,18 +148,14 @@ def run_eval(
             orbit_pred = torch.argmax(orbit_out["logits"], dim=-1)[0].detach().cpu().tolist()
             orbit_prog = decode_program(orbit_pred, prog_vocab_obj)
             orbit_exec, _, _ = interp.execute(orbit_prog, otext)
-            if not outputs_equivalent(orbit_exec, out):
-                orbit_ok = False
-            if alignment_distance(prog, orbit_prog) > 1:
-                orbit_ok = False
-            if kl_divergence(base_out["mu"], orbit_out["mu"]).item() > 0.5:
-                orbit_ok = False
-        orbit_pass.append(orbit_ok)
+            orbit_execs.append(orbit_exec)
+        orbit_pass.append(orbit_output_pass(out, orbit_execs))
 
-        flip_ok = True
-        for ftext in flips:
+        flip_execs = []
+        flip_ys = []
+        for fvar in ex.flips:
             flip_ids = torch.tensor(
-                [text_vocab.encode(ftext, cfg["train"]["max_text_len"])],
+                [text_vocab.encode(fvar.x, cfg["train"]["max_text_len"])],
                 dtype=torch.long,
                 device=torch_device,
             )
@@ -162,27 +163,23 @@ def run_eval(
                 flip_out = model(flip_ids)
             flip_pred = torch.argmax(flip_out["logits"], dim=-1)[0].detach().cpu().tolist()
             flip_prog = decode_program(flip_pred, prog_vocab_obj)
-            flip_exec, _, _ = interp.execute(flip_prog, ftext)
-            if outputs_equivalent(flip_exec, out):
-                flip_ok = False
-            if kl_divergence(base_out["mu"], flip_out["mu"]).item() < 0.1:
-                flip_ok = False
-        flip_pass.append(flip_ok)
+            flip_exec, _, _ = interp.execute(flip_prog, fvar.x)
+            flip_execs.append(flip_exec)
+            flip_ys.append(fvar.y)
+        flip_pass.append(flip_output_pass(out, ex.y, flip_execs, flip_ys))
 
-        # Repair attempt
-        if c_sum > 0:
-            best = c_sum
-            fixed = False
-            for candidate in propose_repairs(prog, report.meta.get("formal", {}).get("meta", {})):
-                out2, _, _ = interp.execute(candidate, ex.x)
-                rep2 = mesh.run(ex.x, candidate, out2, domain=ex.domain, expected=ex.y, constraints=ex.constraints)
-                c2 = sum(rep2.c)
-                if c2 < best:
-                    best = c2
-                if c2 == 0:
-                    fixed = True
-                    break
-            repaired.append(fixed)
+        # Repair attempt (bounded) for formal failures only.
+        if not formal_ok:
+            rep = mesh.run(
+                ex.x,
+                prog,
+                out,
+                domain=ex.domain,
+                constraints=ex.constraints,
+                repair=True,
+                max_repairs=2,
+            )
+            repaired.append(bool(rep.meta.get("repair", {}).get("success", False)))
         else:
             repaired.append(True)
 
@@ -218,15 +215,17 @@ def load_eval_config(path: str) -> dict[str, Any]:
 
 def run_eval_suite(config_path: str, device: str | torch.device | None = None) -> dict[str, Any]:
     cfg = load_eval_config(config_path)
+    set_orbit_parallelism(bool(cfg.get("parallel_orbits", False)))
+    log_every = int(cfg.get("log_every", 50))
     ckpt = cfg.get("ckpt", "out/ckpt.pt")
     schema_path = cfg.get("schema_path", "out/data/schema.jsonl")
     math_path = cfg.get("math_path", "out/data/math.jsonl")
     csp_path = cfg.get("csp_path", "out/data/csp.jsonl")
     out_path = cfg.get("out_path", "out/report.json")
     report = {
-        "schema": run_eval(schema_path, ckpt, out_path="out/schema_report.json", device=device),
-        "math": run_eval(math_path, ckpt, out_path="out/math_report.json", device=device),
-        "csp": run_eval(csp_path, ckpt, out_path="out/csp_report.json", device=device),
+        "schema": run_eval(schema_path, ckpt, out_path="out/schema_report.json", device=device, log_every=log_every),
+        "math": run_eval(math_path, ckpt, out_path="out/math_report.json", device=device, log_every=log_every),
+        "csp": run_eval(csp_path, ckpt, out_path="out/csp_report.json", device=device, log_every=log_every),
     }
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

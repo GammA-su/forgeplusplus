@@ -20,6 +20,21 @@ class ProgramMutator:
                     new_inst = Instruction(opcode=inst.opcode, args=args, dest=inst.dest)
                     new_prog = Program(insts[:i] + [new_inst] + insts[i + 1 :])
                     mutants.append(new_prog)
+        # Swap extracted numbers (indices) if present
+        extract_idxs = [i for i, inst in enumerate(insts) if inst.opcode == "EXTRACT_INT" and "index" in inst.args]
+        if len(extract_idxs) >= 2:
+            i1, i2 = extract_idxs[0], extract_idxs[1]
+            inst1 = insts[i1]
+            inst2 = insts[i2]
+            args1 = dict(inst1.args)
+            args2 = dict(inst2.args)
+            args1["index"], args2["index"] = args2["index"], args1["index"]
+            new_inst1 = Instruction(opcode=inst1.opcode, args=args1, dest=inst1.dest)
+            new_inst2 = Instruction(opcode=inst2.opcode, args=args2, dest=inst2.dest)
+            new_insts = list(insts)
+            new_insts[i1] = new_inst1
+            new_insts[i2] = new_inst2
+            mutants.append(Program(new_insts))
         # Increment extract index
         for i, inst in enumerate(insts):
             if inst.opcode == "EXTRACT_INT" and "index" in inst.args:
@@ -27,6 +42,14 @@ class ProgramMutator:
                 args["index"] = int(args["index"]) + 1
                 new_inst = Instruction(opcode=inst.opcode, args=args, dest=inst.dest)
                 mutants.append(Program(insts[:i] + [new_inst] + insts[i + 1 :]))
+        # Drop a constraint-related step (e.g., solver or arithmetic op)
+        for i, inst in enumerate(insts):
+            if inst.opcode in {"SOLVE_CSP", "ADD", "SUB", "MUL", "DIV"}:
+                new_insts = list(insts)
+                new_insts.pop(i)
+                if new_insts:
+                    mutants.append(Program(new_insts))
+                break
         # Force division by zero edge case
         for i, inst in enumerate(insts):
             if inst.opcode == "DIV":
@@ -43,6 +66,16 @@ class ProgramMutator:
                     fields.pop(key, None)
                     new_inst = Instruction(opcode="EMIT", args={**inst.args, "fields": fields}, dest=inst.dest)
                     mutants.append(Program(insts[:i] + [new_inst] + insts[i + 1 :]))
+        # Empty/NaN-like edge cases in EMIT
+        for i, inst in enumerate(insts):
+            if inst.opcode == "EMIT" and isinstance(inst.args.get("fields"), dict):
+                fields = dict(inst.args.get("fields", {}))
+                if fields:
+                    key = sorted(fields.keys())[0]
+                    fields[key] = float("nan")
+                    new_inst = Instruction(opcode="EMIT", args={**inst.args, "fields": fields}, dest=inst.dest)
+                    mutants.append(Program(insts[:i] + [new_inst] + insts[i + 1 :]))
+                break
         return mutants
 
 

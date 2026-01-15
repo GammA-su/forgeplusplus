@@ -33,3 +33,12 @@ class CodeVerifier:
             violations["code_fail"] = 1.0
             meta["stderr"] = result.stderr[-200:]
         return VerifierResult(valid=not violations, violations=violations, meta=meta)
+
+    def verify_batch(
+        self,
+        text: str,
+        programs: list[Any],
+        outputs: list[Any],
+        constraints: list[dict[str, Any]] | None = None,
+    ) -> list[VerifierResult]:
+        return [self.verify(text, program, output) for program, output in zip(programs, outputs)]

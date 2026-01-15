@@ -40,15 +40,9 @@ def _is_acyclic(tasks: dict[str, int], constraints: list[tuple[str, str]]) -> bo
 class CSPVerifier:
     name = "csp"
 
-    def verify(
-        self,
-        text: str,
-        program: Any,
-        output: Any,
-        constraints: list[dict[str, Any]] | None = None,
-    ) -> VerifierResult:
-        violations: dict[str, float] = {}
-        meta: dict[str, Any] = {}
+    def _load_constraints(
+        self, text: str, constraints: list[dict[str, Any]] | None
+    ) -> tuple[dict[str, int], list[tuple[str, str]]]:
         task_map = _parse_tasks(text)
         prec = _parse_constraints(text)
         for constraint in normalize_constraints(constraints):
@@ -57,6 +51,13 @@ class CSPVerifier:
                 task_map = args.get("tasks", task_map)
                 prec = args.get("constraints", prec)
                 break
+        return task_map, prec
+
+    def _validate_output(
+        self, output: Any, task_map: dict[str, int], prec: list[tuple[str, str]]
+    ) -> VerifierResult:
+        violations: dict[str, float] = {}
+        meta: dict[str, Any] = {}
         acyclic = _is_acyclic(task_map, prec)
         schedule = None
         status = None
@@ -88,3 +89,23 @@ class CSPVerifier:
                 t = start + task_map.get(task, 0)
         valid = not violations
         return VerifierResult(valid=valid, violations=violations, meta=meta)
+
+    def verify(
+        self,
+        text: str,
+        program: Any,
+        output: Any,
+        constraints: list[dict[str, Any]] | None = None,
+    ) -> VerifierResult:
+        task_map, prec = self._load_constraints(text, constraints)
+        return self._validate_output(output, task_map, prec)
+
+    def verify_batch(
+        self,
+        text: str,
+        programs: list[Any],
+        outputs: list[Any],
+        constraints: list[dict[str, Any]] | None = None,
+    ) -> list[VerifierResult]:
+        task_map, prec = self._load_constraints(text, constraints)
+        return [self._validate_output(output, task_map, prec) for output in outputs]

@@ -41,17 +41,9 @@ class SchemaVerifier:
     def __init__(self) -> None:
         self.validator = Draft7Validator(PERSON_SCHEMA)
 
-    def verify(
-        self,
-        text: str,
-        program: Any,
-        output: Any,
-        constraints: list[dict[str, Any]] | None = None,
-    ) -> VerifierResult:
+    def _validate_output(self, output: Any, validator: Draft7Validator) -> VerifierResult:
         violations: dict[str, float] = {}
         meta: dict[str, Any] = {}
-        schema = _schema_from_constraints(constraints)
-        validator = Draft7Validator(schema)
         if not isinstance(output, dict):
             violations["schema_type"] = 1.0
             return VerifierResult(valid=False, violations=violations, meta=meta)
@@ -75,3 +67,25 @@ class SchemaVerifier:
             meta["extra_keys"] = list(sorted(set(extra_keys)))
         valid = not violations
         return VerifierResult(valid=valid, violations=violations, meta=meta)
+
+    def verify(
+        self,
+        text: str,
+        program: Any,
+        output: Any,
+        constraints: list[dict[str, Any]] | None = None,
+    ) -> VerifierResult:
+        schema = _schema_from_constraints(constraints)
+        validator = Draft7Validator(schema)
+        return self._validate_output(output, validator)
+
+    def verify_batch(
+        self,
+        text: str,
+        programs: list[Any],
+        outputs: list[Any],
+        constraints: list[dict[str, Any]] | None = None,
+    ) -> list[VerifierResult]:
+        schema = _schema_from_constraints(constraints)
+        validator = Draft7Validator(schema)
+        return [self._validate_output(output, validator) for output in outputs]

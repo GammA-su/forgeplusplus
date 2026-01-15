@@ -6,17 +6,30 @@ from typing import Any
 from fc.dsl.program import Instruction, Program
 
 
-def _extract_by_key(text: str, key: str) -> str | None:
-    pattern = rf"{re.escape(key)}\s*(?:[:=]|is)\s*([^\n;,.]+)"
+def _normalize_stop(stop: str | None) -> str | None:
+    if stop is None:
+        return None
+    if stop in {"\\n", "newline", "line"}:
+        return "\n"
+    return stop
+
+
+def _extract_by_key(text: str, key: str, stop: str | None = None) -> str | None:
+    stop = _normalize_stop(stop)
+    if stop:
+        stop_pat = re.escape(stop)
+        pattern = rf"{re.escape(key)}\s*(?:[:=]|is)\s*([^{stop_pat}]+)"
+    else:
+        pattern = rf"{re.escape(key)}\s*(?:[:=]|is)\s*([^\n;,.]+)"
     match = re.search(pattern, text, flags=re.IGNORECASE)
     if match:
         return match.group(1).strip()
     return None
 
 
-def _extract_int(text: str, key: str | None, index: int | None) -> int | None:
+def _extract_int(text: str, key: str | None, index: int | None, stop: str | None) -> int | None:
     if key is not None:
-        val = _extract_by_key(text, key)
+        val = _extract_by_key(text, key, stop=stop)
         if val is None:
             return None
         digits = re.findall(r"-?\d+", val)
@@ -29,9 +42,9 @@ def _extract_int(text: str, key: str | None, index: int | None) -> int | None:
     return int(ints[index])
 
 
-def _extract_str(text: str, key: str | None) -> str | None:
+def _extract_str(text: str, key: str | None, stop: str | None) -> str | None:
     if key is not None:
-        val = _extract_by_key(text, key)
+        val = _extract_by_key(text, key, stop=stop)
         if val is None:
             return None
         return val.strip()
@@ -108,13 +121,15 @@ class Interpreter:
         if op == "EXTRACT_INT":
             key = inst.args.get("key")
             index = inst.args.get("index")
-            val = _extract_int(text, key, index)
+            stop = inst.args.get("stop")
+            val = _extract_int(text, key, index, stop)
             if inst.dest:
                 state[inst.dest] = val
             return val
         if op == "EXTRACT_STR":
             key = inst.args.get("key")
-            val = _extract_str(text, key)
+            stop = inst.args.get("stop")
+            val = _extract_str(text, key, stop)
             if inst.dest:
                 state[inst.dest] = val
             return val

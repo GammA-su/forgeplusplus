@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from fc.dsl.program import Instruction, Program
-from fc.dsl.tokens import TokenVocab, Value
+from fc.dsl.tokens import OPCODES, TokenVocab, Value
 
 
 def _value_to_tokens(value: Value) -> list[str]:
@@ -37,7 +37,7 @@ def _value_to_tokens(value: Value) -> list[str]:
     raise TypeError(f"Unsupported value: {value}")
 
 
-def encode_program(program: Program, vocab: TokenVocab) -> list[int]:
+def program_to_tokens(program: Program) -> list[str]:
     tokens: list[str] = ["<BOS>", "BEGIN"]
     for inst in program.instructions:
         tokens.extend(["OP", inst.opcode])
@@ -47,6 +47,11 @@ def encode_program(program: Program, vocab: TokenVocab) -> list[int]:
             tokens.extend(["ARG", key, "VAL"])
             tokens.extend(_value_to_tokens(inst.args[key]))
     tokens.extend(["END", "<EOS>"])
+    return tokens
+
+
+def encode_program(program: Program, vocab: TokenVocab) -> list[int]:
+    tokens = program_to_tokens(program)
     return [vocab.encode(tok) for tok in tokens]
 
 
@@ -99,8 +104,14 @@ def decode_program(token_ids: Iterable[int], vocab: TokenVocab) -> Program:
         if tok != "OP":
             idx += 1
             continue
+        if idx + 1 >= len(tokens):
+            break
         opcode = tokens[idx + 1]
         idx += 2
+        if opcode not in OPCODES:
+            while idx < len(tokens) and tokens[idx] not in ("OP", "END"):
+                idx += 1
+            continue
         dest: str | None = None
         args: dict[str, Value] = {}
         while idx < len(tokens):
@@ -108,19 +119,30 @@ def decode_program(token_ids: Iterable[int], vocab: TokenVocab) -> Program:
             if tok == "OP" or tok == "END":
                 break
             if tok == "DEST":
+                if idx + 1 >= len(tokens):
+                    idx += 1
+                    continue
                 dest_token = tokens[idx + 1]
                 if dest_token.startswith("STR:"):
                     dest = dest_token.split(":", 1)[1]
                 idx += 2
                 continue
             if tok == "ARG":
+                if idx + 2 >= len(tokens):
+                    idx += 1
+                    continue
                 key = tokens[idx + 1]
                 if tokens[idx + 2] != "VAL":
                     idx += 1
                     continue
-                val, next_idx = _parse_value(tokens, idx + 3)
-                args[key] = val
-                idx = next_idx
+                try:
+                    val, next_idx = _parse_value(tokens, idx + 3)
+                except (ValueError, IndexError):
+                    idx += 1
+                    continue
+                else:
+                    args[key] = val
+                    idx = next_idx
                 continue
             idx += 1
         instructions.append(Instruction(opcode=opcode, args=args, dest=dest))

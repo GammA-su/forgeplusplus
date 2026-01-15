@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 import yaml
@@ -49,11 +50,14 @@ class TrainConfig:
     mdl_beta: float
     regret_margin: float
     causal_delta: float
+    shuffle: bool = False
+    proof_supervision: bool = True
 
 
 @dataclass(frozen=True)
 class WeightConfig:
     ce: float = 1.0
+    proof: float = 1.0
     kkt: float = 0.2
     mdl: float = 0.1
     regret: float = 0.1
@@ -74,6 +78,18 @@ def _build_model(cfg: dict[str, Any], vocab_size: int) -> ForgeModel:
     mcfg = ModelConfig(vocab_size=vocab_size, max_prog_len=cfg["max_prog_len"], backbone=bcfg, slots=scfg, primal_dual=pcfg)
     return ForgeModel(mcfg)
 
+
+def _apply_mode(cfg: dict[str, Any]) -> str:
+    mode = cfg.get("mode", "forge")
+    if mode == "ablation":
+        cfg.setdefault("primal_dual", {})
+        cfg["primal_dual"]["steps"] = 1
+        weights = cfg.setdefault("weights", {})
+        weights["kkt"] = 0.0
+        weights["orbit"] = 0.0
+    cfg["mode"] = mode
+    return mode
+
 def load_examples(
     schema_path: str,
     math_path: str,
@@ -84,6 +100,33 @@ def load_examples(
     return loader(schema_path) + loader(math_path) + loader(csp_path)
 
 
+def _epoch_indices(size: int, rng: random.Random, shuffle: bool) -> Iterator[int]:
+    indices = list(range(size))
+    if shuffle:
+        rng.shuffle(indices)
+    return iter(indices)
+
+
+def _next_batch(
+    examples: list[Example],
+    iterator: Iterator[int],
+    batch_size: int,
+    rng: random.Random,
+    shuffle: bool,
+) -> tuple[list[Example], Iterator[int]]:
+    if not examples:
+        raise ValueError("Cannot iterate empty dataset.")
+    batch: list[Example] = []
+    while len(batch) < batch_size:
+        try:
+            idx = next(iterator)
+        except StopIteration:
+            iterator = _epoch_indices(len(examples), rng, shuffle)
+            continue
+        batch.append(examples[idx])
+    return batch, iterator
+
+
 def train(
     examples: list[Example],
     config_path: str,
@@ -91,6 +134,10 @@ def train(
     device: str | torch.device | None = None,
 ) -> Path:
     cfg = load_config(config_path)
+    mode = _apply_mode(cfg)
+    weights = cfg.setdefault("weights", {})
+    if "proof" not in weights and "ce" in weights:
+        weights["proof"] = weights["ce"]
     train_cfg = TrainConfig(**cfg["train"])
     weight_cfg = WeightConfig(**cfg.get("weights", {}))
     set_seed(train_cfg.seed)
@@ -127,8 +174,10 @@ def train(
     mesh = VerifierMesh()
     train_logs: list[dict[str, Any]] = []
 
+    rng = random.Random(train_cfg.seed)
+    batch_iter = _epoch_indices(len(examples), rng, train_cfg.shuffle)
     for step in range(train_cfg.steps):
-        batch = [examples[(step + i) % len(examples)] for i in range(train_cfg.batch_size)]
+        batch, batch_iter = _next_batch(examples, batch_iter, train_cfg.batch_size, rng, train_cfg.shuffle)
         batch_data = collate_batch(batch, text_vocab, prog_vocab, train_cfg.max_text_len, train_cfg.max_prog_len)
         input_ids = batch_data["input_ids"].to(torch_device)
         program_ids = batch_data["program_ids"].to(torch_device)
@@ -142,47 +191,57 @@ def train(
         chosen_idx = outputs["chosen_index"]
         programs = outputs["programs"]
 
-        ce = ce_loss_fn(logits.view(-1, logits.size(-1)), program_ids.view(-1))
+        if train_cfg.proof_supervision and weight_cfg.proof > 0.0 and (program_ids != pad_id).any():
+            prog_ce = ce_loss_fn(logits.view(-1, logits.size(-1)), program_ids.view(-1))
+        else:
+            prog_ce = torch.tensor(0.0, device=torch_device)
         program_len = (pred_program_ids != pad_id).sum(dim=1)
 
-        c_hard_list: list[list[float]] = []
-        for ex, prog in zip(batch, programs):
-            out, _, _ = interp.execute(prog, ex.x)
-            orbits = [o.x for o in ex.orbit]
-            flips = [f.x for f in ex.flips]
-            report = mesh.run(
-                ex.x,
-                prog,
-                out,
-                domain=ex.domain,
-                orbits=orbits,
-                flips=flips,
-                constraints=ex.constraints,
-            )
-            c_hard_list.append(list(report.c))
-        c_hard = torch.tensor(c_hard_list, dtype=torch.float32, device=torch_device)
-        kkt = kkt_loss(c_hard, mu)
+        if weight_cfg.kkt > 0.0:
+            c_hard_list: list[list[float]] = []
+            for ex, prog in zip(batch, programs):
+                out, _, _ = interp.execute(prog, ex.x)
+                orbits = [o.x for o in ex.orbit]
+                flips = [f.x for f in ex.flips]
+                report = mesh.run(
+                    ex.x,
+                    prog,
+                    out,
+                    domain=ex.domain,
+                    orbits=orbits,
+                    flips=flips,
+                    constraints=ex.constraints,
+                )
+                c_hard_list.append(list(report.c))
+            c_hard = torch.tensor(c_hard_list, dtype=torch.float32, device=torch_device)
+            kkt = kkt_loss(c_hard, mu)
+        else:
+            c_hard = torch.zeros(program_ids.size(0), len(mesh.constraint_names), device=torch_device)
+            kkt = torch.tensor(0.0, device=torch_device)
         mdl = mdl_loss(program_len, mu, train_cfg.mdl_alpha, train_cfg.mdl_beta)
 
         # Regret over sampled candidates
         reg = regret_loss(-candidate_scores, chosen_idx, train_cfg.regret_margin)
 
         # Orbit and causal losses using first orbit/flip text
-        orbit_texts = [ex.orbit[0].x if ex.orbit else ex.x for ex in batch]
-        orbit_ids = torch.tensor(
-            [text_vocab.encode(t, train_cfg.max_text_len) for t in orbit_texts],
-            dtype=torch.long,
-            device=torch_device,
-        )
-        orbit_out = model(orbit_ids)
-        orbit_prog_dist: list[float] = []
-        for base_prog, orb_prog in zip(programs, orbit_out["programs"]):
-            if base_prog.instructions and orb_prog.instructions:
-                orbit_prog_dist.append(float(alignment_distance(base_prog, orb_prog)))
-            else:
-                orbit_prog_dist.append(0.0)
-        orbit_dist = torch.tensor(orbit_prog_dist, device=torch_device, dtype=torch.float32)
-        orbit = orbit_invariance_loss(mu, orbit_out["mu"], orbit_dist)
+        if weight_cfg.orbit > 0.0:
+            orbit_texts = [ex.orbit[0].x if ex.orbit else ex.x for ex in batch]
+            orbit_ids = torch.tensor(
+                [text_vocab.encode(t, train_cfg.max_text_len) for t in orbit_texts],
+                dtype=torch.long,
+                device=torch_device,
+            )
+            orbit_out = model(orbit_ids)
+            orbit_prog_dist: list[float] = []
+            for base_prog, orb_prog in zip(programs, orbit_out["programs"]):
+                if base_prog.instructions and orb_prog.instructions:
+                    orbit_prog_dist.append(float(alignment_distance(base_prog, orb_prog)))
+                else:
+                    orbit_prog_dist.append(0.0)
+            orbit_dist = torch.tensor(orbit_prog_dist, device=torch_device, dtype=torch.float32)
+            orbit = orbit_invariance_loss(mu, orbit_out["mu"], orbit_dist)
+        else:
+            orbit = torch.tensor(0.0, device=torch_device)
 
         flip_texts = [ex.flips[0].x if ex.flips else ex.x for ex in batch]
         flip_ids = torch.tensor(
@@ -197,7 +256,7 @@ def train(
         state_loss = state_progress_loss(state_logits, state_targets, adjacency)
 
         loss = (
-            weight_cfg.ce * ce
+            weight_cfg.proof * prog_ce
             + weight_cfg.kkt * kkt
             + weight_cfg.mdl * mdl
             + weight_cfg.regret * reg
@@ -213,7 +272,7 @@ def train(
         log_row = {
             "step": step,
             "loss": float(loss.item()),
-            "ce": float(ce.item()),
+            "prog_ce": float(prog_ce.item()),
             "kkt": float(kkt.item()),
             "mdl": float(mdl.item()),
             "regret": float(reg.item()),
@@ -226,10 +285,10 @@ def train(
         train_logs.append(log_row)
         if step % 10 == 0:
             logger.info(
-                "step=%d loss=%.4f ce=%.4f kkt=%.4f orbit=%.4f",
+                "step=%d loss=%.4f prog_ce=%.4f kkt=%.4f orbit=%.4f",
                 step,
                 loss.item(),
-                ce.item(),
+                prog_ce.item(),
                 kkt.item(),
                 orbit.item(),
             )
@@ -237,6 +296,7 @@ def train(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     ckpt = {
+        "mode": mode,
         "model": model.state_dict(),
         "text_vocab": text_vocab.token_to_id,
         "prog_vocab": prog_vocab.token_to_id,

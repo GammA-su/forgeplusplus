@@ -30,6 +30,7 @@ ARG_KEYS = [
     "tasks",
     "constraints",
     "value",
+    "stop",
 ]
 
 NAMES = ["Alice", "Bob", "Cara", "Dion", "Eve", "Fay"]
