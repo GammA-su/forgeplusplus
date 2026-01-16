@@ -4,6 +4,7 @@ import re
 from typing import Iterable
 
 from fc.dsl.tokens import CITIES, NAMES
+from fc.util.tags import apply_tag, split_domain_tag
 
 
 def _find_field(text: str, key: str) -> str | None:
@@ -27,7 +28,8 @@ def _parse_schema(text: str) -> dict[str, str | int]:
 
 
 def schema_orbits(text: str) -> list[str]:
-    fields = _parse_schema(text)
+    tag, base = split_domain_tag(text)
+    fields = _parse_schema(base)
     templates = [
         "Record: name={name}; age={age}; city={city}.",
         "Profile: city={city}, name={name}, age={age}.",
@@ -38,7 +40,8 @@ def schema_orbits(text: str) -> list[str]:
         "Details:\n- name: {name}\n- age: {age}\n- city: {city}\n- note: ignore",
         "Record: name={name}; age={age}; city={city}.\nNote: ignore this line.",
     ]
-    return [t.format(**fields) for t in templates]
+    orbits = [t.format(**fields) for t in templates]
+    return [apply_tag(tag, orbit) for orbit in orbits]
 
 
 def _parse_math(text: str) -> tuple[int, int, str]:
@@ -57,7 +60,8 @@ def _parse_math(text: str) -> tuple[int, int, str]:
 
 
 def math_orbits(text: str) -> list[str]:
-    a, b, op = _parse_math(text)
+    tag, base = split_domain_tag(text)
+    a, b, op = _parse_math(base)
     templates = [
         "Compute: {a} {sym} {b}.",
         "What is {a} {op} {b}?",
@@ -69,7 +73,8 @@ def math_orbits(text: str) -> list[str]:
     ]
     sym = {"plus": "+", "minus": "-", "times": "*", "divide": "/"}.get(op, "+")
     op_word = {"plus": "add", "minus": "subtract", "times": "multiply", "divide": "divide"}[op]
-    return [t.format(a=a, b=b, op=op, sym=sym, op_word=op_word) for t in templates]
+    orbits = [t.format(a=a, b=b, op=op, sym=sym, op_word=op_word) for t in templates]
+    return [apply_tag(tag, orbit) for orbit in orbits]
 
 
 def _parse_csp(text: str) -> tuple[dict[str, int], list[tuple[str, str]]]:
@@ -81,7 +86,8 @@ def _parse_csp(text: str) -> tuple[dict[str, int], list[tuple[str, str]]]:
 
 
 def csp_orbits(text: str) -> list[str]:
-    tasks, constraints = _parse_csp(text)
+    tag, base = split_domain_tag(text)
+    tasks, constraints = _parse_csp(base)
     task_items = list(tasks.items())
     task_part = ",".join(f"{k}={v}" for k, v in task_items)
     task_part_rev = ",".join(f"{k}={v}" for k, v in reversed(task_items))
@@ -97,7 +103,7 @@ def csp_orbits(text: str) -> list[str]:
         + "\n- ".join(f"{a}<{b}" for a, b in constraints),
         f"Tasks: {task_part}. Constraints: {cons_part}. Note: single resource.",
     ]
-    return templates
+    return [apply_tag(tag, orbit) for orbit in templates]
 
 
 def generate_orbits(domain: str, text: str) -> list[str]:

@@ -8,13 +8,14 @@ from typing import Any, Iterable
 import torch
 from pydantic import BaseModel, Field
 
-from fc.dsl.codec import encode_program, program_to_tokens
+from fc.dsl.codec import decode_program, encode_program, program_to_tokens
 from fc.dsl.program import Instruction, Program
 from fc.dsl.tokens import CITIES, NAMES, TASKS, build_default_vocab
 from fc.morph.flips import generate_flips, _next_name
 from fc.morph.orbit import generate_orbits
 from fc.morph.equiv import outputs_equivalent
 from fc.util.jsonl import read_jsonl, write_jsonl
+from fc.util.tags import apply_domain_tag
 
 
 class ConstraintSpec(BaseModel):
@@ -174,6 +175,10 @@ def _select_texts(texts: list[str], count: int | None) -> list[str]:
     return [texts[i % len(texts)] for i in range(count)]
 
 
+def _tag_variants(domain: str, variants: list[Variant]) -> list[Variant]:
+    return [variant.model_copy(update={"x": apply_domain_tag(domain, variant.x)}) for variant in variants]
+
+
 def _make_orbits(domain: str, base_x: str, base_y: Any, count: int | None) -> list[Variant]:
     orbit_texts = generate_orbits(domain, base_x)
     if not orbit_texts:
@@ -181,7 +186,8 @@ def _make_orbits(domain: str, base_x: str, base_y: Any, count: int | None) -> li
     orbit_texts = _select_texts(orbit_texts, count)
     if count is not None and count > 0 and not orbit_texts:
         orbit_texts = [base_x for _ in range(count)]
-    return [Variant(x=txt, y=base_y) for txt in orbit_texts]
+    variants = [Variant(x=txt, y=base_y) for txt in orbit_texts]
+    return _tag_variants(domain, variants)
 
 
 def _fallback_math_flip(base_x: str, base_y: Any) -> Variant:
@@ -280,14 +286,14 @@ def _make_flips(domain: str, base_x: str, base_y: Any, count: int | None) -> lis
         elif domain == "csp":
             filtered.append(_fallback_csp_flip(base_x, base_y))
     if count is None:
-        return filtered
+        return _tag_variants(domain, filtered)
     if count <= 0:
         return []
     if not filtered:
         return []
     while len(filtered) < count:
         filtered.append(filtered[len(filtered) % len(filtered)])
-    return filtered[:count]
+    return _tag_variants(domain, filtered[:count])
 
 
 def generate_schema_example(idx: int, rng: random.Random, orbits: int | None, flips: int | None) -> Example:
@@ -301,6 +307,7 @@ def generate_schema_example(idx: int, rng: random.Random, orbits: int | None, fl
         "- name: {name}\n- age: {age}\n- city: {city}",
     ]
     x = rng.choice(templates).format(name=name, age=age, city=city)
+    x = apply_domain_tag("schema", x)
     y = {"name": name, "age": age, "city": city}
     prog = _schema_program()
     orbits_out = _make_orbits("schema", x, y, orbits)
@@ -347,6 +354,7 @@ def generate_math_example(idx: int, rng: random.Random, orbits: int | None, flip
     ]
     op_word = {"+": "plus", "-": "minus", "*": "times", "/": "divided by"}[op]
     x = rng.choice(templates).format(a=a, b=b, op=op, op_word=op_word)
+    x = apply_domain_tag("math", x)
     if op == "+":
         y = a + b
     elif op == "-":
@@ -365,7 +373,7 @@ def generate_math_example(idx: int, rng: random.Random, orbits: int | None, flip
         x=x,
         y=y,
         constraints=constraints,
-        proof=prog.to_dict(),
+        proof=program_to_proof(prog),
         orbit=orbits_out,
         flips=flips_out,
     )
@@ -386,6 +394,7 @@ def generate_csp_example(idx: int, rng: random.Random, orbits: int | None, flips
     task_part = ",".join(f"{t}={durations[t]}" for t in tasks)
     cons_part = ",".join(f"{a}<{b}" for a, b in cons)
     x = f"Tasks: {task_part}. Constraints: {cons_part}."
+    x = apply_domain_tag("csp", x)
     # Expected schedule is sequential in order tasks[0], tasks[1], tasks[2]
     schedule = {}
     t = 0
@@ -403,7 +412,7 @@ def generate_csp_example(idx: int, rng: random.Random, orbits: int | None, flips
         x=x,
         y=y,
         constraints=constraints,
-        proof=prog.to_dict(),
+        proof=program_to_proof(prog),
         orbit=orbits_out,
         flips=flips_out,
     )
@@ -473,6 +482,15 @@ def proof_to_token_ids(proof: dict[str, Any], vocab: Any) -> list[int]:
         return ids
     program = Program.from_dict(proof)
     return encode_program(program, vocab)
+
+
+def proof_to_program(proof: dict[str, Any], vocab: Any) -> Program:
+    if not proof:
+        return Program(instructions=[])
+    if proof.get("dsl") == "PTv1":
+        token_ids = proof_to_token_ids(proof, vocab)
+        return decode_program(token_ids, vocab)
+    return Program.from_dict(proof)
 
 
 def collate_batch(

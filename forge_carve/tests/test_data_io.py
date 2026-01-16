@@ -1,11 +1,12 @@
-from fc.dsl.program import Program
 from fc.interp.core import Interpreter
 from fc.train.data import (
     generate_dataset,
     load_dataset,
     load_dataset_with_variants,
+    proof_to_program,
     save_dataset,
 )
+from fc.dsl.tokens import build_default_vocab
 from fc.verify.arithmetic import ArithmeticVerifier
 from fc.verify.csp import CSPVerifier
 from fc.verify.schema import SchemaVerifier
@@ -30,7 +31,7 @@ def test_jsonl_rows_validate_and_expand(tmp_path) -> None:
 def test_verifiers_accept_generated_rows() -> None:
     for domain in ["schema", "math", "csp"]:
         ex = generate_dataset(domain, n=1, seed=11)[0]
-        program = Program.from_dict(ex.proof)
+        program = proof_to_program(ex.proof, build_default_vocab())
         out, _, errors = Interpreter().execute(program, ex.x)
         assert not errors
         constraints = [c.model_dump() for c in ex.constraints]

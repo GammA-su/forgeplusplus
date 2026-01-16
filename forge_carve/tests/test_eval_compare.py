@@ -143,11 +143,16 @@ def test_eval_compare_script_writes_file(tmp_path: Path) -> None:
     baseline_ckpt = _write_baseline_ckpt(tmp_path, texts, answers)
     forge_ckpt = _write_forge_ckpt(tmp_path, texts)
     out_path = tmp_path / "reports" / "compare.json"
+    config_out_path = tmp_path / "reports" / "config_compare.json"
+    config_path = tmp_path / "eval_compare.yaml"
+    config_path.write_text(f'out_path: "{config_out_path}"\n', encoding="utf-8")
     script = Path(__file__).resolve().parents[1] / "scripts" / "eval_compare.py"
     subprocess.run(
         [
             sys.executable,
             str(script),
+            "--config",
+            str(config_path),
             "--baseline-ckpt",
             str(baseline_ckpt),
             "--forge-ckpt",
@@ -167,5 +172,6 @@ def test_eval_compare_script_writes_file(tmp_path: Path) -> None:
         text=True,
     )
     assert out_path.exists()
+    assert not config_out_path.exists()
     loaded = json.loads(out_path.read_text())
     assert "baseline" in loaded

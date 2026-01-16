@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from fc.dsl.tokens import NAMES
+from fc.util.tags import apply_tag, split_domain_tag
 
 
 def _replace_field(text: str, key: str, new_val: str) -> str | None:
@@ -27,6 +28,8 @@ def _next_name(name: str) -> str:
 
 
 def schema_flips(text: str) -> list[str]:
+    tag, base = split_domain_tag(text)
+    text = base
     age_match = re.search(r"age\s*(?:[:=]|is)\s*(\d+)", text, flags=re.IGNORECASE)
     name_match = re.search(r"name\s*(?:[:=]|is)\s*([^\n;,.]+)", text, flags=re.IGNORECASE)
     flips = []
@@ -41,20 +44,24 @@ def schema_flips(text: str) -> list[str]:
         updated = _replace_field(text, "name", new_name)
         if updated:
             flips.append(updated)
-    return flips
+    return [apply_tag(tag, flip) for flip in flips]
 
 
 def math_flips(text: str) -> list[str]:
+    tag, base = split_domain_tag(text)
+    text = base
     nums = re.findall(r"-?\d+", text)
     flips = []
     if nums:
         first = nums[0]
         new_first = str(int(first) + 1)
         flips.append(text.replace(first, new_first, 1))
-    return flips
+    return [apply_tag(tag, flip) for flip in flips]
 
 
 def csp_flips(text: str) -> list[str]:
+    tag, base = split_domain_tag(text)
+    text = base
     flips = []
     tasks = re.findall(r"([A-Z])\s*=\s*(\d+)", text)
     if tasks:
@@ -70,7 +77,7 @@ def csp_flips(text: str) -> list[str]:
         else:
             updated = text + f" Constraints: {b}<{a}."
         flips.append(updated)
-    return flips
+    return [apply_tag(tag, flip) for flip in flips]
 
 
 def generate_flips(domain: str, text: str) -> list[str]:

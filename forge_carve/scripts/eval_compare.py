@@ -22,12 +22,12 @@ def main(
     schema_path: str = "out/data/schema.jsonl",
     math_path: str = "out/data/math.jsonl",
     csp_path: str = "out/data/csp.jsonl",
-    out: str = typer.Option("out/compare.json", "--out"),
+    out: str = typer.Option("", "--out"),
 ) -> None:
     configure_logging()
     logger = get_logger(__name__)
     runtime = configure_runtime(logger)
-    out_path = out
+    out_path = out or "out/compare.json"
     if config:
         with open(config, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
@@ -37,8 +37,8 @@ def main(
         schema_path = cfg.get("schema_path", schema_path)
         math_path = cfg.get("math_path", math_path)
         csp_path = cfg.get("csp_path", csp_path)
-        if out == "out/compare.json":
-            out_path = cfg.get("out_path", out_path)
+        if not out:
+            out_path = cfg.get("compare_out_path") or cfg.get("out_path") or out_path
     logger.info(
         "eval_compare baseline=%s forge=%s ablation=%s schema=%s math=%s csp=%s out=%s",
         baseline_ckpt,
