@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import torch
@@ -108,11 +110,62 @@ def test_eval_compare_runs(tmp_path: Path) -> None:
     )
     assert "baseline" in report
     assert "forge" in report
+    for key in ["overall", "schema", "math", "csp"]:
+        assert key in report["baseline"]
+        assert key in report["forge"]
     assert out_path.exists()
     loaded = json.loads(out_path.read_text())
-    assert set(loaded["baseline"].keys()) == {
+    assert set(loaded["baseline"]["overall"].keys()) == {
         "verified_accuracy",
         "orbit_invariance",
         "flip_sensitivity",
         "confident_error_rate",
     }
+
+
+def test_eval_compare_script_writes_file(tmp_path: Path) -> None:
+    schema = generate_dataset("schema", n=1, seed=4)
+    math = generate_dataset("math", n=1, seed=5)
+    csp = generate_dataset("csp", n=1, seed=6)
+    schema_path = tmp_path / "schema.jsonl"
+    math_path = tmp_path / "math.jsonl"
+    csp_path = tmp_path / "csp.jsonl"
+    save_dataset(str(schema_path), schema)
+    save_dataset(str(math_path), math)
+    save_dataset(str(csp_path), csp)
+    examples = schema + math + csp
+    texts = []
+    for ex in examples:
+        texts.append(ex.x)
+        texts.extend([o.x for o in ex.orbit])
+        texts.extend([f.x for f in ex.flips])
+    answers = [serialize_answer(ex.y) for ex in examples]
+    baseline_ckpt = _write_baseline_ckpt(tmp_path, texts, answers)
+    forge_ckpt = _write_forge_ckpt(tmp_path, texts)
+    out_path = tmp_path / "reports" / "compare.json"
+    script = Path(__file__).resolve().parents[1] / "scripts" / "eval_compare.py"
+    subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--baseline-ckpt",
+            str(baseline_ckpt),
+            "--forge-ckpt",
+            str(forge_ckpt),
+            "--schema-path",
+            str(schema_path),
+            "--math-path",
+            str(math_path),
+            "--csp-path",
+            str(csp_path),
+            "--out",
+            str(out_path),
+        ],
+        check=True,
+        cwd=str(script.parent.parent),
+        capture_output=True,
+        text=True,
+    )
+    assert out_path.exists()
+    loaded = json.loads(out_path.read_text())
+    assert "baseline" in loaded

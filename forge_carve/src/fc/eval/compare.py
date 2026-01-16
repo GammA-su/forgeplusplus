@@ -79,6 +79,14 @@ def _load_examples(schema_path: str, math_path: str, csp_path: str) -> list[Exam
     return [Example.model_validate(r) for r in rows]
 
 
+def _split_by_domain(examples: list[Example]) -> dict[str, list[Example]]:
+    grouped = {"schema": [], "math": [], "csp": []}
+    for ex in examples:
+        if ex.domain in grouped:
+            grouped[ex.domain].append(ex)
+    return grouped
+
+
 def _predict_baseline(
     model: BaselineModel,
     text_vocab: TextVocab,
@@ -245,13 +253,32 @@ def run_compare(
     device: str | torch.device | None = None,
 ) -> dict[str, Any]:
     examples = _load_examples(schema_path, math_path, csp_path)
+    grouped = _split_by_domain(examples)
     report: dict[str, Any] = {}
     if baseline_ckpt:
-        report["baseline"] = evaluate_baseline(examples, baseline_ckpt, device=device)
+        baseline_overall = evaluate_baseline(examples, baseline_ckpt, device=device)
+        report["baseline"] = {
+            "overall": baseline_overall,
+            "schema": evaluate_baseline(grouped["schema"], baseline_ckpt, device=device),
+            "math": evaluate_baseline(grouped["math"], baseline_ckpt, device=device),
+            "csp": evaluate_baseline(grouped["csp"], baseline_ckpt, device=device),
+        }
     if forge_ckpt:
-        report["forge"] = evaluate_forge(examples, forge_ckpt, device=device)
+        forge_overall = evaluate_forge(examples, forge_ckpt, device=device)
+        report["forge"] = {
+            "overall": forge_overall,
+            "schema": evaluate_forge(grouped["schema"], forge_ckpt, device=device),
+            "math": evaluate_forge(grouped["math"], forge_ckpt, device=device),
+            "csp": evaluate_forge(grouped["csp"], forge_ckpt, device=device),
+        }
     if ablation_ckpt:
-        report["ablation"] = evaluate_forge(examples, ablation_ckpt, device=device)
+        ablation_overall = evaluate_forge(examples, ablation_ckpt, device=device)
+        report["ablation"] = {
+            "overall": ablation_overall,
+            "schema": evaluate_forge(grouped["schema"], ablation_ckpt, device=device),
+            "math": evaluate_forge(grouped["math"], ablation_ckpt, device=device),
+            "csp": evaluate_forge(grouped["csp"], ablation_ckpt, device=device),
+        }
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(report, indent=2))
