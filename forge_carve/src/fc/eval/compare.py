@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,6 +23,8 @@ from fc.util.jsonl import read_jsonl
 from fc.verify.mesh import VerifierMesh
 
 CONF_THRESHOLD = 0.8
+
+logger = logging.getLogger(__name__)
 
 
 def _load_text_vocab(mapping: dict[str, int]) -> TextVocab:
@@ -48,6 +51,13 @@ def _formal_confidence(mesh: VerifierMesh, report: Any) -> float:
     ]
     c_sum = sum(report.c[i] for i in indices)
     return float(1.0 / (1.0 + c_sum))
+
+
+def _log_eval_progress(stage: str, idx: int, total: int, domain: str) -> None:
+    if not total:
+        return
+    if idx % 10 == 0 or idx + 1 == total:
+        logger.info("%s %s progress %d/%d", stage, domain, idx + 1, total)
 
 
 def _mean(vals: Iterable[bool]) -> float:
@@ -127,6 +137,7 @@ def evaluate_baseline(
     torch_device = torch.device(device_str)
     model.to(torch_device)
     model.eval()
+    logger.info("baseline evaluation start rows=%d device=%s", len(examples), torch_device)
 
     mesh = VerifierMesh()
     correct = []
@@ -134,7 +145,8 @@ def evaluate_baseline(
     flip_ok = []
     confs = []
 
-    for ex in examples:
+    for idx, ex in enumerate(examples):
+        _log_eval_progress("baseline", idx, len(examples), ex.domain)
         pred = _predict_baseline(model, text_vocab, answer_vocab, ex.x, max_text_len, torch_device)
         report = mesh.run(ex.x, program=None, output=pred, domain=ex.domain, constraints=ex.constraints)
         confs.append(_formal_confidence(mesh, report))
@@ -205,6 +217,7 @@ def evaluate_forge(
     torch_device = torch.device(device_str)
     model.to(torch_device)
     model.eval()
+    logger.info("forge evaluation start rows=%d device=%s", len(examples), torch_device)
 
     interp = Interpreter()
     mesh = VerifierMesh()
@@ -214,7 +227,8 @@ def evaluate_forge(
     confs = []
     max_text_len = cfg["train"]["max_text_len"]
 
-    for ex in examples:
+    for idx, ex in enumerate(examples):
+        _log_eval_progress("forge", idx, len(examples), ex.domain)
         prog, out = _predict_forge(model, text_vocab, prog_vocab, ex.x, max_text_len, torch_device, interp)
         report = mesh.run(ex.x, prog, out, domain=ex.domain, constraints=ex.constraints)
         confs.append(_formal_confidence(mesh, report))
@@ -254,6 +268,7 @@ def run_compare(
 ) -> dict[str, Any]:
     examples = _load_examples(schema_path, math_path, csp_path)
     grouped = _split_by_domain(examples)
+    logger.info("run_compare loaded=%d schema=%d math=%d csp=%d", len(examples), len(grouped["schema"]), len(grouped["math"]), len(grouped["csp"]))
     report: dict[str, Any] = {}
     if baseline_ckpt:
         baseline_overall = evaluate_baseline(examples, baseline_ckpt, device=device)
