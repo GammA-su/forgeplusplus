@@ -15,7 +15,9 @@ from fc.morph.flips import generate_flips, _next_name
 from fc.morph.orbit import generate_orbits
 from fc.morph.equiv import outputs_equivalent
 from fc.util.jsonl import read_jsonl, write_jsonl
-from fc.util.tags import apply_domain_tag
+from fc.util.tags import DOMAIN_TAGS, DOMAIN_TAG_PATTERN, apply_domain_tag
+
+_TOKEN_PATTERN = re.compile(fr"{DOMAIN_TAG_PATTERN}|\b\w+\b|[+\-*/]")
 
 
 class ConstraintSpec(BaseModel):
@@ -32,12 +34,17 @@ class Variant(BaseModel):
 class Example(BaseModel):
     id: str
     domain: str
+    domain_tag: str = ""
     x: str
     y: Any
     constraints: list[ConstraintSpec] = Field(default_factory=list)
     proof: dict[str, Any]
     orbit: list[Variant] = Field(default_factory=list)
     flips: list[Variant] = Field(default_factory=list)
+
+
+def _tokenize_text(text: str) -> list[str]:
+    return _TOKEN_PATTERN.findall(text)
 
 
 @dataclass(frozen=True)
@@ -47,17 +54,22 @@ class TextVocab:
 
     @staticmethod
     def build(texts: Iterable[str]) -> "TextVocab":
-        tokens = {"<PAD>", "<UNK>", "<BOS>", "<EOS>"}
+        tokens: set[str] = {"<PAD>", "<UNK>", "<BOS>", "<EOS>"}
         for text in texts:
-            for tok in re.findall(r"\b\w+\b|[+\-*/]", text):
-                tokens.add(tok.lower())
+            for tok in _tokenize_text(text):
+                if tok in DOMAIN_TAGS.values():
+                    tokens.add(tok)
+                else:
+                    tokens.add(tok.lower())
         ordered = ["<PAD>", "<UNK>", "<BOS>", "<EOS>"] + sorted(tokens - {"<PAD>", "<UNK>", "<BOS>", "<EOS>"})
         token_to_id = {t: i for i, t in enumerate(ordered)}
         id_to_token = {i: t for t, i in token_to_id.items()}
         return TextVocab(token_to_id=token_to_id, id_to_token=id_to_token)
 
     def encode(self, text: str, max_len: int) -> list[int]:
-        toks = [tok.lower() for tok in re.findall(r"\b\w+\b|[+\-*/]", text)]
+        toks = []
+        for tok in _tokenize_text(text):
+            toks.append(tok if tok in DOMAIN_TAGS.values() else tok.lower())
         ids = [self.token_to_id.get(t, self.token_to_id["<UNK>"]) for t in toks]
         ids = [self.token_to_id["<BOS>"]] + ids[: max_len - 2] + [self.token_to_id["<EOS>"]]
         if len(ids) < max_len:
@@ -319,9 +331,11 @@ def generate_schema_example(idx: int, rng: random.Random, orbits: int | None, fl
             args={"schema": "person", "required": ["name", "age", "city"], "no_extra": True},
         )
     ]
+    tag = DOMAIN_TAGS["schema"]
     return Example(
         id=f"schema_{idx}",
         domain="schema",
+        domain_tag=tag,
         x=x,
         y=y,
         constraints=constraints,
@@ -367,9 +381,11 @@ def generate_math_example(idx: int, rng: random.Random, orbits: int | None, flip
     orbits_out = _make_orbits("math", x, y, orbits)
     flips_out = _make_flips("math", x, y, flips)
     constraints = [ConstraintSpec(id="arith", type="arithmetic", args={"op": op})]
+    tag = DOMAIN_TAGS["math"]
     return Example(
         id=f"math_{idx}",
         domain="math",
+        domain_tag=tag,
         x=x,
         y=y,
         constraints=constraints,
@@ -406,9 +422,11 @@ def generate_csp_example(idx: int, rng: random.Random, orbits: int | None, flips
     orbits_out = _make_orbits("csp", x, y, orbits)
     flips_out = _make_flips("csp", x, y, flips)
     constraints = [ConstraintSpec(id="csp", type="csp", args={"tasks": durations, "constraints": cons})]
+    tag = DOMAIN_TAGS["csp"]
     return Example(
         id=f"csp_{idx}",
         domain="csp",
+        domain_tag=tag,
         x=x,
         y=y,
         constraints=constraints,

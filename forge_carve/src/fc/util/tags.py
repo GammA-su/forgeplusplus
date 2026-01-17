@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from typing import Tuple
 
 DOMAIN_TAGS = {
@@ -7,6 +9,9 @@ DOMAIN_TAGS = {
     "math": "[MATH]",
     "csp": "[CSP]",
 }
+
+TAG_TO_DOMAIN = {tag: domain for domain, tag in DOMAIN_TAGS.items()}
+DOMAIN_TAG_PATTERN = "|".join(re.escape(tag) for tag in DOMAIN_TAGS.values())
 
 
 def split_domain_tag(text: str) -> Tuple[str | None, str]:
@@ -28,3 +33,10 @@ def apply_tag(tag: str | None, text: str) -> str:
 
 def apply_domain_tag(domain: str, text: str) -> str:
     return apply_tag(DOMAIN_TAGS.get(domain), text)
+
+
+def domain_from_tag(text: str) -> str | None:
+    for tag, domain in TAG_TO_DOMAIN.items():
+        if text.startswith(tag):
+            return domain
+    return None

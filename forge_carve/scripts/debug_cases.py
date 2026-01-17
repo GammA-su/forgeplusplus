@@ -14,6 +14,7 @@ from fc.interp.core import Interpreter
 from fc.train.answer import AnswerVocab, parse_answer
 from fc.train.data import Example, TextVocab
 from fc.util.jsonl import read_jsonl
+from fc.util.tags import domain_from_tag
 from fc.verify.mesh import VerifierMesh
 
 app = typer.Typer(add_completion=False)
@@ -170,9 +171,11 @@ def main(
         c_hard = float(sum(float(v) for v in violations.values())) if violations else 0.0
         status = "PASS" if formal.get("valid", False) else "FAIL"
         top = _top_violations(violations)
+        tag = ex.domain_tag or domain_from_tag(ex.x) or ""
+        snippet = ex.x[:16]
 
         print(
-            f"[{idx}] y_true={_fmt_value(ex.y)} y_pred={_fmt_value(pred)} "
+            f"[{idx}] tag={tag} snippet={snippet} y_true={_fmt_value(ex.y)} y_pred={_fmt_value(pred)} "
             f"status={status} c_hard={c_hard:.3f} top_violations={top}"
         )
         if program is not None:

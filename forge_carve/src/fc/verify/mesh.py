@@ -10,6 +10,7 @@ from fc.verify.base import MeshReport
 from fc.dsl.repair import repair_program
 from fc.verify.code import CodeVerifier
 from fc.verify.csp import CSPVerifier
+from fc.util.tags import domain_from_tag
 from fc.verify.schema import SchemaVerifier
 
 CONSTRAINT_NAMES = ["schema", "arith", "csp", "code", "orbit", "flip", "adv_caught"]
@@ -108,7 +109,9 @@ class VerifierMesh:
     ) -> MeshReport:
         c = [0.0 for _ in CONSTRAINT_NAMES]
         meta: dict[str, Any] = {"formal": {}, "orbit": {}, "flip": {}, "adv": {}}
-        verifier, formal_idx = self._select_formal_verifier(domain)
+        resolved_domain = domain_from_tag(text) or domain
+        meta["domain_used"] = resolved_domain
+        verifier, formal_idx = self._select_formal_verifier(resolved_domain)
         res = self._verify_formal(verifier, text, program, output, constraints=constraints)
         c[formal_idx] = 1.0 if not res.valid else 0.0
         meta["formal"] = res.model_dump()
@@ -141,7 +144,7 @@ class VerifierMesh:
             mutants = mutator.mutate(program)
             adv_fail = 0
             if mutants:
-                adv_verifier = self._select_adv_verifier(domain)
+                adv_verifier = self._select_adv_verifier(resolved_domain)
                 adv_outs = [self.interp.execute(mprog, text)[0] for mprog in mutants]
                 results = self._verify_formal_batch(adv_verifier, text, mutants, adv_outs, constraints=constraints)
                 adv_fail = sum(1 for res in results if res.valid)
