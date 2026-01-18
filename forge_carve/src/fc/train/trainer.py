@@ -11,7 +11,6 @@ import yaml
 from torch import nn
 
 from fc.dsl.codec import alignment_distance, decode_program
-from fc.dsl.tokens import build_default_vocab
 from fc.interp.core import Interpreter
 from fc.model.backbone import BackboneConfig
 from fc.model.forge import ForgeModel, ModelConfig
@@ -20,6 +19,9 @@ from fc.model.slots import SlotConfig
 from fc.train.data import (
     Example,
     TextVocab,
+    audit_proof_tokens,
+    audit_proof_tokens_from_paths,
+    build_program_vocab_from_examples,
     collate_batch,
     load_dataset,
     load_dataset_with_variants,
@@ -149,7 +151,8 @@ def train(
         texts.extend([o.x for o in ex.orbit])
         texts.extend([f.x for f in ex.flips])
     text_vocab = TextVocab.build(texts)
-    prog_vocab = build_default_vocab()
+    audit_proof_tokens(examples)
+    prog_vocab = build_program_vocab_from_examples(examples)
 
     cfg["text_vocab_size"] = len(text_vocab.token_to_id)
     model = _build_model(cfg, vocab_size=len(prog_vocab.token_to_id))
@@ -319,5 +322,6 @@ def train_from_paths(
     csp_path: str = "out/data/csp.jsonl",
     device: str | torch.device | None = None,
 ) -> Path:
+    audit_proof_tokens_from_paths([schema_path, math_path, csp_path])
     examples = load_examples(schema_path, math_path, csp_path, include_variants=True)
     return train(examples, config_path=config_path, out_dir=out_dir, device=device)

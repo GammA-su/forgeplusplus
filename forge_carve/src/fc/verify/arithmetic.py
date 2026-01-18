@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from fc.interp.core import Interpreter
+from fc.util.math_expr import eval_math_expression
 from fc.verify.base import VerifierResult, normalize_constraints
 
 
@@ -15,6 +16,9 @@ class ArithmeticVerifier:
         self.interp = Interpreter()
 
     def _parse_expected(self, text: str, op_override: str | None = None) -> float | None:
+        expr_val = eval_math_expression(text)
+        if expr_val is not None:
+            return expr_val
         nums = [int(x) for x in re.findall(r"-?\d+", text)]
         if len(nums) < 2:
             return None

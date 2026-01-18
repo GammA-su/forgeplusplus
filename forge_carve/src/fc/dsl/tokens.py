@@ -9,14 +9,20 @@ SPECIAL_TOKENS = ["<PAD>", "<BOS>", "<EOS>", "<UNK>"]
 
 OPCODES = [
     "EXTRACT_INT",
+    "EXTRACT_FLOAT",
     "EXTRACT_STR",
     "BIND",
     "ADD",
     "SUB",
     "MUL",
     "DIV",
+    "APPLY_ARITH",
+    "APPLY_TOPO",
+    "APPLY_CUMSUM",
     "SOLVE_CSP",
     "EMIT",
+    "EMIT_NUM",
+    "EMIT_SCHEDULE",
 ]
 
 ARG_KEYS = [
@@ -35,8 +41,26 @@ ARG_KEYS = [
 
 NAMES = ["Alice", "Bob", "Cara", "Dion", "Eve", "Fay"]
 CITIES = ["Paris", "Berlin", "Oslo", "Lima", "Riga", "Pune"]
-TASKS = ["A", "B", "C", "D"]
-SYMBOLS = ["name", "age", "city", "a", "b", "result", "schedule", "status", "tasks", "constraints"]
+TASKS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+OP_SYMBOLS = ["+", "-", "*", "/"]
+SYMBOLS = [
+    "name",
+    "age",
+    "city",
+    "a",
+    "b",
+    "c",
+    "d",
+    "result",
+    "t0",
+    "t1",
+    "t2",
+    "schedule",
+    "status",
+    "tasks",
+    "constraints",
+    "order",
+]
 
 SCHEMAS = ["person", "math", "schedule"]
 STATUS = ["ok", "infeasible"]
@@ -88,7 +112,7 @@ def build_default_vocab(extra_tokens: Iterable[str] | None = None) -> TokenVocab
         + ARG_KEYS
         + _int_tokens()
         + _bool_tokens()
-        + _str_tokens(NAMES + CITIES + TASKS + SCHEMAS + STATUS + SYMBOLS)
+        + _str_tokens(NAMES + CITIES + TASKS + SCHEMAS + STATUS + SYMBOLS + OP_SYMBOLS)
     )
     if extra_tokens:
         base.extend(list(extra_tokens))
