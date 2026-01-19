@@ -24,7 +24,7 @@ def _normalize_text(text: str) -> str:
 
 def _eval_node(node: ast.AST) -> float:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return float(node.value)
+        return int(node.value)
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
         val = _eval_node(node.operand)
         return val if isinstance(node.op, ast.UAdd) else -val

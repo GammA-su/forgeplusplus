@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+from fractions import Fraction
+
+def _to_float(v):
+    # Accept ints, floats, Fractions, and 'p/q' strings
+    if isinstance(v, str) and '/' in v:
+        n, d = v.split('/', 1)
+        return float(Fraction(int(n.strip()), int(d.strip())))
+    return float(v)
+
+def _canon12(x: float) -> float:
+    return float(f"{x:.12g}")
+
 import math
 import re
 from typing import Any
@@ -68,13 +80,13 @@ class ArithmeticVerifier:
             meta["arith_got"] = got
             return VerifierResult(valid=False, violations=violations, meta=meta)
         try:
-            got_val = float(got)
+            got_val = _canon12(_to_float(got))
         except (TypeError, ValueError):
             violations["arith"] = 1.0
             meta["arith_expected"] = expected
             meta["arith_got"] = got
             return VerifierResult(valid=False, violations=violations, meta=meta)
-        if not math.isfinite(got_val) or abs(got_val - float(expected)) > 1e-6:
+        if not math.isfinite(got_val) or abs(got_val - _canon12(_to_float(expected))) > 1e-6:
             violations["arith"] = 1.0
             meta["arith_expected"] = expected
             meta["arith_got"] = got

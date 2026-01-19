@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 import re
 from collections import defaultdict, deque
@@ -205,9 +206,17 @@ class PTv1Runtime:
                 elif opv == "*":
                     r = a * b
                 elif opv == "/":
-                    r = a / b
+                    if isinstance(a, (int, Fraction)) and isinstance(b, (int, Fraction)):
+                        r = Fraction(a, b)
+                    else:
+                        r = a / b
                 else:
                     raise ValueError(f"unknown arithmetic op: {opv}")
+
+                if isinstance(r, Fraction) and r.denominator == 1:
+                    r = int(r.numerator)
+                elif isinstance(r, float) and r.is_integer():
+                    r = int(r)
 
                 if dest is None:
                     raise ValueError("APPLY_ARITH missing DEST")

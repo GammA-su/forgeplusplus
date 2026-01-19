@@ -158,6 +158,11 @@ def main(
             pred_ids = outputs["answer_ids"][0].detach().cpu().tolist()
             pred_text = answer_vocab.decode(pred_ids)
             pred = parse_answer(pred_text)
+            if pred is None:
+                from fc.util.runtime_solve import runtime_solve
+                proof_tokens = [prog_vocab.decode(i) for i in pred_ids]
+                pred = runtime_solve(ex.x, ex.constraints, proof_tokens)
+
         else:
             if prog_vocab is None:
                 raise SystemExit("Missing prog_vocab for forge checkpoint")
