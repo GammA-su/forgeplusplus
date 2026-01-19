@@ -6,8 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
-import numcanon
-from fc.util.runtime_solve import runtime_solve
+from prooftape.ptv1 import PTv1Runtime
 
 
 def _hash_tokens(tokens: Iterable[Any]) -> str:
@@ -53,6 +52,8 @@ def main() -> int:
     inp = Path(sys.argv[1])
     outp = Path(sys.argv[2])
 
+    rt = PTv1Runtime()
+
     rows = 0
     patched_y = 0
     patched_sha = 0
@@ -84,9 +85,8 @@ def main() -> int:
                         # keep as-is; verify_proofs should fail this dataset if corrupted
                         pass
 
-                got = runtime_solve(rec.get("x", ""), rec.get("constraints") or [], tokens)
-                got = numcanon.canon_json(got)
-                if numcanon.canon_json(rec.get("y")) != got:
+                got = rt.run(rec.get("x", ""), rec.get("constraints") or [], tokens)
+                if rec.get("y") != got:
                     rec["y"] = got
                     patched_y += 1
 

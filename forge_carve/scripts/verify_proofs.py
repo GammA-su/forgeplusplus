@@ -1,4 +1,5 @@
 from __future__ import annotations
+import numcanon
 
 import hashlib
 import json
@@ -112,7 +113,9 @@ def main() -> int:
                     if not isinstance(rec, dict):
                         raise ValueError("record_not_object")
                     got = _verify_record(rec, rt, seen_sigs)
+                    got = numcanon.canon_json(got)
                     exp = rec.get("y")
+                    exp = numcanon.canon_json(exp)
                     if not _eq(got, exp):
                         bad += 1
                         _report_fail("answer_mismatch", rec, ln, got=got, exp=exp)

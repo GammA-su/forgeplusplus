@@ -90,15 +90,19 @@ def main(path: str, n: int, mode: str) -> int:
         if base_err:
             print(base_err, file=sys.stderr)
         return 1
-    random.shuffle(rows)
-    sample = rows[: min(n, len(rows))]
+    idxs = list(range(len(rows)))
+    random.shuffle(idxs)
+    idxs = idxs[: min(n, len(idxs))]
 
+    corrupted = list(rows)
     if mode == "answer-sanity":
-        corrupted = [_corrupt_answer(r) for r in sample]
+        for i in idxs:
+            corrupted[i] = _corrupt_answer(rows[i])
         fail_msg = "SANITY FAIL: verifier accepted corrupted answers (bad=0)."
         ok_msg = "SANITY OK: verifier rejects corrupted answers."
     else:
-        corrupted = [_corrupt_proof(r) for r in sample]
+        for i in idxs:
+            corrupted[i] = _corrupt_proof(rows[i])
         fail_msg = "SANITY FAIL: verifier accepted corrupted proofs (bad=0)."
         ok_msg = "SANITY OK: verifier rejects corrupted proofs."
 

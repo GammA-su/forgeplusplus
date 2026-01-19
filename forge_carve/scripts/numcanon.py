@@ -1,13 +1,9 @@
 import math
 from typing import Any
 
-# Canonical numeric policy:
-# - If a float is effectively an integer, store it as int.
-# - Otherwise, keep a stable decimal float with fixed significant digits.
-# This keeps JSON labels deterministic while remaining tolerant to runtime noise.
+# Tight enough to only catch float representation noise.
 _ABS = 1e-9
 _REL = 1e-12
-_SIGFIGS = 12
 
 def canon_json(v: Any) -> Any:
     """Canonicalize JSON-ish values; mainly fixes float noise."""
@@ -20,8 +16,8 @@ def canon_json(v: Any) -> Any:
         # If it's basically an int, make it an int (prevents 41610.00000000001)
         if math.isclose(v, r, rel_tol=_REL, abs_tol=_ABS):
             return int(r)
-        # Otherwise keep a stable float (keeps repr controlled)
-        return float(f"{v:.{_SIGFIGS}g}")
+        # Otherwise keep a stable float (optional; keeps repr controlled)
+        return float(f"{v:.12g}")
     if isinstance(v, list):
         return [canon_json(x) for x in v]
     if isinstance(v, dict):
