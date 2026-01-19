@@ -90,6 +90,8 @@ def main(path: str, n: int, mode: str) -> int:
         if base_err:
             print(base_err, file=sys.stderr)
         return 1
+    if base_out:
+        print(base_out)
     idxs = list(range(len(rows)))
     random.shuffle(idxs)
     idxs = idxs[: min(n, len(idxs))]

@@ -35,6 +35,7 @@ from fc.train.losses import (
     state_progress_loss,
 )
 from fc.util.jsonl import write_jsonl
+from fc.util.vocab_identity import vocab_identity
 from fc.util.logging import configure_logging, get_logger
 from fc.util.seed import set_seed
 from fc.verify.mesh import VerifierMesh
@@ -54,6 +55,7 @@ class TrainConfig:
     causal_delta: float
     shuffle: bool = False
     proof_supervision: bool = True
+    proof_supervision_source: str = "proof"
 
 
 @dataclass(frozen=True)
@@ -151,8 +153,11 @@ def train(
         texts.extend([o.x for o in ex.orbit])
         texts.extend([f.x for f in ex.flips])
     text_vocab = TextVocab.build(texts)
-    audit_proof_tokens(examples)
-    prog_vocab = build_program_vocab_from_examples(examples)
+    audit_proof_tokens(examples, proof_source=train_cfg.proof_supervision_source)
+    prog_vocab = build_program_vocab_from_examples(
+        examples,
+        proof_source=train_cfg.proof_supervision_source,
+    )
 
     cfg["text_vocab_size"] = len(text_vocab.token_to_id)
     model = _build_model(cfg, vocab_size=len(prog_vocab.token_to_id))
@@ -181,7 +186,14 @@ def train(
     batch_iter = _epoch_indices(len(examples), rng, train_cfg.shuffle)
     for step in range(train_cfg.steps):
         batch, batch_iter = _next_batch(examples, batch_iter, train_cfg.batch_size, rng, train_cfg.shuffle)
-        batch_data = collate_batch(batch, text_vocab, prog_vocab, train_cfg.max_text_len, train_cfg.max_prog_len)
+        batch_data = collate_batch(
+            batch,
+            text_vocab,
+            prog_vocab,
+            train_cfg.max_text_len,
+            train_cfg.max_prog_len,
+            proof_source=train_cfg.proof_supervision_source,
+        )
         input_ids = batch_data["input_ids"].to(torch_device)
         program_ids = batch_data["program_ids"].to(torch_device)
         outputs = model(input_ids)
@@ -298,11 +310,14 @@ def train(
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+    prog_id = vocab_identity(prog_vocab.token_to_id)
     ckpt = {
         "mode": mode,
         "model": model.state_dict(),
         "text_vocab": text_vocab.token_to_id,
         "prog_vocab": prog_vocab.token_to_id,
+        "prog_vocab_sha256": prog_id.sha256,
+        "prog_vocab_tokens": prog_id.tokens_by_id,
         "config": cfg,
     }
     ckpt_path = out_path / "ckpt.pt"
@@ -322,6 +337,11 @@ def train_from_paths(
     csp_path: str = "out/data/csp.jsonl",
     device: str | torch.device | None = None,
 ) -> Path:
-    audit_proof_tokens_from_paths([schema_path, math_path, csp_path])
+    cfg = load_config(config_path)
+    proof_source = cfg.get("train", {}).get("proof_supervision_source", "proof")
+    audit_proof_tokens_from_paths(
+        [schema_path, math_path, csp_path],
+        proof_source=proof_source,
+    )
     examples = load_examples(schema_path, math_path, csp_path, include_variants=True)
     return train(examples, config_path=config_path, out_dir=out_dir, device=device)

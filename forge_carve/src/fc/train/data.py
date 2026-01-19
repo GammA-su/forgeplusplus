@@ -5,6 +5,7 @@ import json
 import math
 import random
 import re
+from fractions import Fraction
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -20,7 +21,7 @@ from fc.morph.orbit import generate_orbits
 from fc.morph.equiv import outputs_equivalent
 from fc.util.runtime_solve import runtime_solve
 from fc.util.jsonl import read_jsonl, write_jsonl
-from fc.util.math_expr import eval_math_expression
+from fc.util.math_expr import eval_math_expression, parse_math_expression_ast
 from fc.util.tags import DOMAIN_TAGS, DOMAIN_TAG_PATTERN, apply_domain_tag
 import numcanon
 
@@ -46,6 +47,7 @@ class Example(BaseModel):
     y: Any
     constraints: list[ConstraintSpec] = Field(default_factory=list)
     proof: dict[str, Any]
+    proof_tokens_gold: list[str] | None = None
     orbit: list[Variant] = Field(default_factory=list)
     flips: list[Variant] = Field(default_factory=list)
 
@@ -118,7 +120,7 @@ def _schema_y_from_text(text: str) -> dict[str, Any]:
     return {"name": name, "age": age, "city": city}
 
 
-def _math_y_from_text(text: str) -> float:
+def _math_y_from_text(text: str) -> Any:
     val = eval_math_expression(text)
     if val is not None:
         return val
@@ -335,13 +337,14 @@ def generate_schema_example(idx: int, rng: random.Random, orbits: int | None, fl
     name = rng.choice(NAMES)
     age = rng.randint(18, 60)
     city = rng.choice(CITIES)
+    note = f"ref{rng.randint(100000, 999999)}"
     templates = [
-        "Record: name={name}; age={age}; city={city}.",
-        "Profile: name={name}, city={city}, age={age}.",
-        "name={name}; age={age}; city={city}; note=ignore",
-        "- name: {name}\n- age: {age}\n- city: {city}",
+        "Record: name={name}; age={age}; city={city}; note={note}.",
+        "Profile: name={name}, city={city}, age={age}. Note={note}.",
+        "name={name}; age={age}; city={city}; note={note}",
+        "- name: {name}\n- age: {age}\n- city: {city}\n- note: {note}",
     ]
-    x = rng.choice(templates).format(name=name, age=age, city=city)
+    x = rng.choice(templates).format(name=name, age=age, city=city, note=note)
     x = apply_domain_tag("schema", x)
     y = numcanon.canon_json({"name": name, "age": age, "city": city})
     prog = _schema_program()
@@ -362,7 +365,7 @@ def generate_schema_example(idx: int, rng: random.Random, orbits: int | None, fl
         x=x,
         y=y,
         constraints=constraints,
-        proof=prog.to_dict(),
+        proof=program_to_proof(prog),
         orbit=orbits_out,
         flips=flips_out,
     )
@@ -446,7 +449,14 @@ def _math_program_from_expr(expr: dict[str, Any]) -> Program:
     ops: list[str] = []
     _math_expr_ops(expr, ops)
     leaves = _math_collect_leaves(expr)
-    use_float = "/" in ops or any(isinstance(leaf["value"], float) for leaf in leaves)
+    def _leaf_is_float(value: Any) -> bool:
+        if isinstance(value, float):
+            return True
+        if isinstance(value, Fraction):
+            return value.denominator != 1
+        return False
+
+    use_float = "/" in ops or any(_leaf_is_float(leaf["value"]) for leaf in leaves)
     extract_op = "EXTRACT_FLOAT" if use_float else "EXTRACT_INT"
     max_idx = max(expr["idx"] for expr in leaves)
     if max_idx + 1 > len(_MATH_LEAF_NAMES):
@@ -458,6 +468,17 @@ def _math_program_from_expr(expr: dict[str, Any]) -> Program:
     _math_compile_expr(expr, insts, temp_idx, is_root=True)
     insts.append(Instruction(opcode="EMIT_NUM", args={"value": "result"}))
     return Program(insts)
+
+
+def math_prompt_to_proof_tokens(text: str) -> list[str] | None:
+    expr = parse_math_expression_ast(text)
+    if expr is None:
+        return None
+    try:
+        program = _math_program_from_expr(expr)
+    except ValueError:
+        return None
+    return program_to_tokens(program)
 
 
 def _math_collect_leaves(expr: dict[str, Any]) -> list[dict[str, Any]]:
@@ -565,6 +586,7 @@ def generate_math_example(idx: int, rng: random.Random, orbits: int | None, flip
     x = rng.choice(templates).format(expr=expr_text)
     x = apply_domain_tag("math", x)
     prog = _math_program_from_expr(expr)
+    gold_tokens = math_prompt_to_proof_tokens(x)
     y = numcanon.canon_json(y)
     orbits_out = _make_orbits("math", x, y, orbits)
     flips_out = _make_flips("math", x, y, flips)
@@ -578,6 +600,7 @@ def generate_math_example(idx: int, rng: random.Random, orbits: int | None, flip
         y=y,
         constraints=constraints,
         proof=program_to_proof(prog),
+        proof_tokens_gold=gold_tokens,
         orbit=orbits_out,
         flips=flips_out,
     )
@@ -790,7 +813,18 @@ def _collect_proof_tokens(
             if isinstance(tok, int):
                 decoded = vocab.decode(tok)
                 if decoded == "<UNK>":
-                    missing_id_counts[tok] += 1
+            missing_id_counts[tok] += 1
+
+
+def _select_proof_tokens(ex: Example | dict[str, Any], source: str) -> dict[str, Any] | None:
+    if source not in {"proof", "gold", "prefer_gold"}:
+        raise ValueError(f"Unknown proof source: {source}")
+    proof = ex.proof if isinstance(ex, Example) else ex.get("proof")
+    if source in {"gold", "prefer_gold"}:
+        gold = ex.proof_tokens_gold if isinstance(ex, Example) else ex.get("proof_tokens_gold")
+        if isinstance(gold, list) and gold:
+            return {"dsl": "PTv1", "tokens": gold}
+    return proof
                 else:
                     seen.add(decoded)
                 continue
@@ -812,13 +846,17 @@ def _collect_proof_tokens(
             missing_counts[tok_str] += 1
 
 
-def audit_proof_tokens(examples: Iterable[Example] | Iterable[dict[str, Any]]) -> list[str]:
+def audit_proof_tokens(
+    examples: Iterable[Example] | Iterable[dict[str, Any]],
+    *,
+    proof_source: str = "proof",
+) -> list[str]:
     vocab = build_default_vocab()
     seen: set[str] = set()
     missing_counts: Counter[str] = Counter()
     missing_id_counts: Counter[int] = Counter()
     for ex in examples:
-        proof = ex.proof if isinstance(ex, Example) else ex.get("proof")
+        proof = _select_proof_tokens(ex, proof_source)
         _collect_proof_tokens(proof, vocab, seen, missing_counts, missing_id_counts)
     if missing_counts or missing_id_counts:
         sample_missing = missing_counts.most_common(10)
@@ -833,15 +871,19 @@ def audit_proof_tokens(examples: Iterable[Example] | Iterable[dict[str, Any]]) -
     return sorted(seen)
 
 
-def audit_proof_tokens_from_paths(paths: Iterable[str]) -> list[str]:
+def audit_proof_tokens_from_paths(paths: Iterable[str], *, proof_source: str = "proof") -> list[str]:
     rows: list[dict[str, Any]] = []
     for path in paths:
         rows.extend(list(read_jsonl(path)))
-    return audit_proof_tokens(rows)
+    return audit_proof_tokens(rows, proof_source=proof_source)
 
 
-def build_program_vocab_from_examples(examples: Iterable[Example]) -> TokenVocab:
-    tokens = audit_proof_tokens(examples)
+def build_program_vocab_from_examples(
+    examples: Iterable[Example],
+    *,
+    proof_source: str = "proof",
+) -> TokenVocab:
+    tokens = audit_proof_tokens(examples, proof_source=proof_source)
     return build_default_vocab(extra_tokens=tokens)
 
 
@@ -895,12 +937,15 @@ def collate_batch(
     prog_vocab: Any,
     max_text_len: int,
     max_prog_len: int,
+    *,
+    proof_source: str = "proof",
 ) -> dict[str, Any]:
     inputs = torch.tensor([text_vocab.encode(ex.x, max_text_len) for ex in batch], dtype=torch.long)
     pad_id = prog_vocab.token_to_id["<PAD>"]
     prog_ids = []
     for ex in batch:
-        proof_ids = proof_to_token_ids(ex.proof, prog_vocab)
+        proof = _select_proof_tokens(ex, proof_source)
+        proof_ids = proof_to_token_ids(proof, prog_vocab) if proof else []
         if not proof_ids:
             prog_ids.append([pad_id] * max_prog_len)
             continue

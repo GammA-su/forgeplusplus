@@ -23,6 +23,10 @@ def main(
     math_path: str = "out/data/math.jsonl",
     csp_path: str = "out/data/csp.jsonl",
     out: str = typer.Option("", "--out"),
+    repair_op: bool = typer.Option(False, "--repair-op"),
+    constrained_op: bool = typer.Option(True, "--constrained-op/--no-constrained-op"),
+    max_proof_tokens: int = typer.Option(0, "--max-proof-tokens"),
+    min_proof_tokens: int = typer.Option(0, "--min-proof-tokens"),
 ) -> None:
     configure_logging()
     logger = get_logger(__name__)
@@ -37,6 +41,10 @@ def main(
         schema_path = cfg.get("schema_path", schema_path)
         math_path = cfg.get("math_path", math_path)
         csp_path = cfg.get("csp_path", csp_path)
+        if max_proof_tokens <= 0:
+            max_proof_tokens = int(cfg.get("max_proof_tokens", 0) or 0)
+        if min_proof_tokens <= 0:
+            min_proof_tokens = int(cfg.get("min_proof_tokens", 0) or 0)
         if not out:
             out_path = cfg.get("compare_out_path") or cfg.get("out_path") or out_path
     logger.info(
@@ -49,6 +57,10 @@ def main(
         csp_path,
         out_path,
     )
+    if config:
+        max_tokens = max_proof_tokens if max_proof_tokens > 0 else None
+    else:
+        max_tokens = 256 if max_proof_tokens <= 0 else max_proof_tokens
     try:
         report = run_compare(
             schema_path=schema_path,
@@ -59,6 +71,10 @@ def main(
             forge_ckpt=forge_ckpt if forge_ckpt else None,
             ablation_ckpt=ablation_ckpt if ablation_ckpt else None,
             device=runtime.device,
+            repair_op=repair_op,
+            constrained_op=constrained_op,
+            min_proof_tokens=min_proof_tokens,
+            max_proof_tokens=max_tokens,
         )
     except Exception:
         logger.exception("eval_compare failed")

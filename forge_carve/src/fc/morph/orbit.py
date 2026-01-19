@@ -44,36 +44,43 @@ def schema_orbits(text: str) -> list[str]:
     return [apply_tag(tag, orbit) for orbit in orbits]
 
 
-def _parse_math(text: str) -> tuple[int, int, str]:
-    nums = [int(x) for x in re.findall(r"-?\d+", text)]
-    if len(nums) < 2:
-        nums = [1, 1]
-    if re.search(r"\+|plus|add", text, flags=re.IGNORECASE):
-        op = "plus"
-    elif re.search(r"-|minus|subtract", text, flags=re.IGNORECASE):
-        op = "minus"
-    elif re.search(r"\*|times|multiply", text, flags=re.IGNORECASE):
-        op = "times"
-    else:
-        op = "divide"
-    return nums[0], nums[1], op
+def _extract_math_expr(text: str) -> str:
+    _, base = split_domain_tag(text)
+    t = base.strip()
+    if ":" in t:
+        t = t.split(":", 1)[1].strip()
+    for lead in [
+        "calculate the value of",
+        "compute exactly",
+        "compute",
+        "evaluate",
+        "work out",
+        "what is",
+        "solve",
+        "find the value of",
+        "find",
+    ]:
+        if t.lower().startswith(lead):
+            t = t[len(lead):].strip()
+            break
+    while t and t[-1] in ".?":
+        t = t[:-1].rstrip()
+    return t or base.strip()
 
 
 def math_orbits(text: str) -> list[str]:
     tag, base = split_domain_tag(text)
-    a, b, op = _parse_math(base)
+    expr = _extract_math_expr(base)
     templates = [
-        "Compute: {a} {sym} {b}.",
-        "What is {a} {op} {b}?",
-        "Calculate {a} {sym} {b} quickly.",
-        "First number: {a}. Second number: {b}. Operation: {sym}.",
-        "a={a}; b={b}; op={sym}.",
-        "Please {op_word} the numbers {a} and {b}.",
-        "Compute {a} {sym} {b}. Note: ignore formatting.",
+        "Compute: {expr}.",
+        "What is {expr}?",
+        "Calculate the value of {expr}.",
+        "Work out {expr}.",
+        "Evaluate: {expr}.",
+        "Expression: {expr}.",
+        "Please compute {expr}.",
     ]
-    sym = {"plus": "+", "minus": "-", "times": "*", "divide": "/"}.get(op, "+")
-    op_word = {"plus": "add", "minus": "subtract", "times": "multiply", "divide": "divide"}[op]
-    orbits = [t.format(a=a, b=b, op=op, sym=sym, op_word=op_word) for t in templates]
+    orbits = [t.format(expr=expr) for t in templates]
     return [apply_tag(tag, orbit) for orbit in orbits]
 
 
@@ -90,13 +97,11 @@ def csp_orbits(text: str) -> list[str]:
     tasks, constraints = _parse_csp(base)
     task_items = list(tasks.items())
     task_part = ",".join(f"{k}={v}" for k, v in task_items)
-    task_part_rev = ",".join(f"{k}={v}" for k, v in reversed(task_items))
     cons_part = ",".join(f"{a}<{b}" for a, b in constraints)
-    cons_part_rev = ",".join(f"{a}<{b}" for a, b in reversed(constraints))
     templates = [
         f"Tasks: {task_part}. Constraints: {cons_part}.",
         f"Schedule tasks ({task_part}); precedence: {cons_part}.",
-        f"Given tasks {task_part_rev} with constraints {cons_part_rev}.",
+        f"Given tasks {task_part} with constraints {cons_part}.",
         "Tasks:\n- "
         + "\n- ".join(f"{k}={v}" for k, v in task_items)
         + "\nConstraints:\n- "

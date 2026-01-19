@@ -1,4 +1,6 @@
 import math
+import re
+from fractions import Fraction
 from typing import Any
 
 # Canonical numeric policy:
@@ -10,10 +12,49 @@ _REL = 1e-12
 _SIGFIGS = 12
 
 
+_FRACTION_RE = re.compile(r"^\s*([+-]?\d+)\s*/\s*([+-]?\d+)\s*$")
+_DECIMAL_RE = re.compile(r"^\s*([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))\s*$")
+
+
+def _fraction_string_to_fraction(text: str) -> Fraction | None:
+    match = _FRACTION_RE.match(text)
+    if not match:
+        return None
+    n, d = match.groups()
+    return Fraction(int(n), int(d))
+
+
+def _decimal_string_to_fraction(text: str) -> Fraction | None:
+    match = _DECIMAL_RE.match(text)
+    if not match:
+        return None
+    sign, whole, frac_a, frac_b = match.groups()
+    frac = frac_b if frac_b is not None else (frac_a or "")
+    whole = whole or "0"
+    if not frac:
+        val = int(whole)
+        return Fraction(-val if sign == "-" else val, 1)
+    num = int(f"{whole}{frac}")
+    if sign == "-":
+        num = -num
+    return Fraction(num, 10 ** len(frac))
+
+
 def canon_json(v: Any) -> Any:
     """Canonicalize JSON-ish values; mainly fixes float noise."""
-    if v is None or isinstance(v, (str, bool, int)):
+    if v is None or isinstance(v, (bool, int)):
         return v
+    if isinstance(v, str):
+        frac = _fraction_string_to_fraction(v)
+        if frac is None:
+            frac = _decimal_string_to_fraction(v)
+        if frac is None:
+            return v
+        v = frac
+    if isinstance(v, Fraction):
+        if v.denominator == 1:
+            return int(v.numerator)
+        v = float(v)
     if isinstance(v, float):
         if not math.isfinite(v):
             return v

@@ -15,10 +15,7 @@ _ALLOWED_TAGS = set(DOMAIN_TAGS.values())
 
 
 def _eq(a: Any, b: Any) -> bool:
-    # float tolerant compare (only where needed)
-    if isinstance(a, float) and isinstance(b, float):
-        return abs(a - b) <= 1e-9
-    return a == b
+    return numcanon.json_equal(a, b)
 
 
 def _hash_tokens(tokens: list[Any]) -> str:

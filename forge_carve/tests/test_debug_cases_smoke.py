@@ -57,7 +57,7 @@ def test_debug_cases_script_smoke(tmp_path: Path) -> None:
         texts.extend([f.x for f in ex.flips])
     ckpt_path = _write_forge_ckpt(tmp_path, texts)
     script = Path(__file__).resolve().parents[1] / "scripts" / "debug_cases.py"
-    subprocess.run(
+    result = subprocess.run(
         [
             sys.executable,
             str(script),
@@ -71,9 +71,11 @@ def test_debug_cases_script_smoke(tmp_path: Path) -> None:
             "2",
             "--device",
             "cpu",
+            "--constrained-op",
         ],
         check=True,
         cwd=str(script.parent.parent),
         capture_output=True,
         text=True,
     )
+    assert "INVALID_OPCODE" not in (result.stdout or "")

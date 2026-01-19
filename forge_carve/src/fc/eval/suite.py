@@ -27,6 +27,10 @@ from fc.morph.equiv import outputs_equivalent
 from fc.dsl.tokens import TokenVocab
 from fc.train.data import Example, TextVocab
 from fc.util.jsonl import read_jsonl
+from fc.util.vocab_identity import assert_vocab_match
+from fc.util.constrained_decode import greedy_decode_with_opcode_mask
+from fc.util.opcode_repair import repair_invalid_opcodes
+from fc.util.runtime_solve import runtime_solve
 from fc.verify.mesh import VerifierMesh, set_orbit_parallelism
 
 
@@ -45,6 +49,10 @@ def run_eval(
     out_path: str,
     device: str | torch.device | None = None,
     log_every: int = 50,
+    repair_op: bool = False,
+    constrained_op: bool = True,
+    min_proof_tokens: int = 0,
+    max_proof_tokens: int | None = None,
 ) -> dict[str, Any]:
     logger = logging.getLogger(__name__)
     rows = [Example.model_validate(r) for r in read_jsonl(data_path)]
@@ -53,6 +61,16 @@ def run_eval(
     prog_vocab = ckpt["prog_vocab"]
     prog_vocab_obj = _load_prog_vocab(prog_vocab)
     cfg = ckpt["config"]
+    prog_vocab_path = Path(ckpt_path).resolve().parent / "prog_vocab.json"
+    if prog_vocab_path.exists():
+        disk_map = json.loads(prog_vocab_path.read_text(encoding="utf-8"))
+        if isinstance(disk_map, dict):
+            assert_vocab_match(
+                prog_vocab,
+                disk_map,
+                expected_label="ckpt.prog_vocab",
+                actual_label=str(prog_vocab_path),
+            )
 
     from fc.model.forge import ForgeModel, ModelConfig
     from fc.model.backbone import BackboneConfig
@@ -95,19 +113,66 @@ def run_eval(
     adv_total = 0
 
     total = len(rows)
-    for idx, ex in enumerate(rows):
-        if log_every > 0 and (idx % log_every == 0 or idx + 1 == total):
-            logger.info("eval progress=%d/%d data=%s", idx + 1, total, data_path)
+    max_tokens = cfg["max_prog_len"] if max_proof_tokens is None else max(1, int(max_proof_tokens))
+    min_tokens = max(0, int(min_proof_tokens))
+    eos_pos_counts: dict[int, int] = {}
+    trunc_count = 0
+
+    def _record_decode_stats(stats: Any) -> None:
+        nonlocal trunc_count
+        if stats is None:
+            return
+        eos_pos = getattr(stats, "eos_pos", None)
+        if eos_pos is None:
+            trunc_count += 1
+            return
+        eos_pos_counts[eos_pos] = eos_pos_counts.get(eos_pos, 0) + 1
+
+    def _predict(text: str, constraints: list[dict[str, Any]] | None) -> tuple[Program, Any]:
         input_ids = torch.tensor(
-            [text_vocab.encode(ex.x, cfg["train"]["max_text_len"])],
+            [text_vocab.encode(text, cfg["train"]["max_text_len"])],
             dtype=torch.long,
             device=torch_device,
         )
         with torch.inference_mode():
             base_out = model(input_ids)
-        pred_ids = torch.argmax(base_out["logits"], dim=-1)[0].detach().cpu().tolist()
+        logits_seq = base_out["logits"][0].detach()
+        pred_ids, decode_stats = greedy_decode_with_opcode_mask(
+            logits_seq,
+            prog_vocab_obj,
+            enforce_opcode=constrained_op,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
+            return_stats=True,
+        )
+        _record_decode_stats(decode_stats)
         prog = decode_program(pred_ids, prog_vocab_obj)
-        out, _, _ = interp.execute(prog, ex.x)
+        out, _, _ = interp.execute(prog, text)
+        if out is None and repair_op:
+            proof_tokens = [prog_vocab_obj.decode(i) for i in pred_ids]
+            runtime_out, failure = runtime_solve(text, constraints or [], proof_tokens, return_error=True)
+            if failure is not None and failure.code == "PARSE_FAIL":
+                repaired_ids, did_repair = repair_invalid_opcodes(
+                    pred_ids,
+                    logits_seq,
+                    prog_vocab_obj,
+                    log_fn=(lambda msg: logger.info(msg)),
+                )
+                if did_repair:
+                    repaired_tokens = [prog_vocab_obj.decode(i) for i in repaired_ids]
+                    runtime_out, _ = runtime_solve(text, constraints or [], repaired_tokens, return_error=True)
+                    if runtime_out is not None:
+                        out = runtime_out
+                        prog = decode_program(repaired_ids, prog_vocab_obj)
+        return prog, out
+
+    for idx, ex in enumerate(rows):
+        if log_every > 0 and (idx % log_every == 0 or idx + 1 == total):
+            logger.info("eval progress=%d/%d data=%s", idx + 1, total, data_path)
+        constraints = [
+            c.model_dump() if hasattr(c, "model_dump") else c for c in (ex.constraints or [])
+        ]
+        prog, out = _predict(ex.x, constraints)
         orbits = [o.x for o in ex.orbit]
         flips = [f.x for f in ex.flips]
         report = mesh.run(
@@ -138,32 +203,14 @@ def run_eval(
 
         orbit_execs = []
         for otext in orbits:
-            orbit_ids = torch.tensor(
-                [text_vocab.encode(otext, cfg["train"]["max_text_len"])],
-                dtype=torch.long,
-                device=torch_device,
-            )
-            with torch.inference_mode():
-                orbit_out = model(orbit_ids)
-            orbit_pred = torch.argmax(orbit_out["logits"], dim=-1)[0].detach().cpu().tolist()
-            orbit_prog = decode_program(orbit_pred, prog_vocab_obj)
-            orbit_exec, _, _ = interp.execute(orbit_prog, otext)
+            _, orbit_exec = _predict(otext, constraints)
             orbit_execs.append(orbit_exec)
         orbit_pass.append(orbit_output_pass(out, orbit_execs))
 
         flip_execs = []
         flip_ys = []
         for fvar in ex.flips:
-            flip_ids = torch.tensor(
-                [text_vocab.encode(fvar.x, cfg["train"]["max_text_len"])],
-                dtype=torch.long,
-                device=torch_device,
-            )
-            with torch.inference_mode():
-                flip_out = model(flip_ids)
-            flip_pred = torch.argmax(flip_out["logits"], dim=-1)[0].detach().cpu().tolist()
-            flip_prog = decode_program(flip_pred, prog_vocab_obj)
-            flip_exec, _, _ = interp.execute(flip_prog, fvar.x)
+            _, flip_exec = _predict(fvar.x, constraints)
             flip_execs.append(flip_exec)
             flip_ys.append(fvar.y)
         flip_pass.append(flip_output_pass(out, ex.y, flip_execs, flip_ys))
@@ -192,6 +239,16 @@ def run_eval(
             if sum(rep.c[:3]) == 0:
                 adv_success += 1
 
+    if eos_pos_counts:
+        ordered = sorted(eos_pos_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        dist = ", ".join([f"{pos}:{count}" for pos, count in ordered])
+        logger.info(
+            "eval_decode eos_pos_top=%s trunc_by_maxlen=%d min_tokens=%d max_tokens=%d",
+            dist,
+            trunc_count,
+            min_tokens,
+            max_tokens,
+        )
     report = {
         "verified_accuracy": verified_accuracy(correct),
         "orbit_invariance_pass_rate": orbit_invariance_pass_rate(orbit_pass),
@@ -213,7 +270,15 @@ def load_eval_config(path: str) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def run_eval_suite(config_path: str, device: str | torch.device | None = None) -> dict[str, Any]:
+def run_eval_suite(
+    config_path: str,
+    device: str | torch.device | None = None,
+    *,
+    repair_op: bool | None = None,
+    constrained_op: bool | None = None,
+    min_proof_tokens: int | None = None,
+    max_proof_tokens: int | None = None,
+) -> dict[str, Any]:
     cfg = load_eval_config(config_path)
     set_orbit_parallelism(bool(cfg.get("parallel_orbits", False)))
     log_every = int(cfg.get("log_every", 50))
@@ -222,10 +287,46 @@ def run_eval_suite(config_path: str, device: str | torch.device | None = None) -
     math_path = cfg.get("math_path", "out/data/math.jsonl")
     csp_path = cfg.get("csp_path", "out/data/csp.jsonl")
     out_path = cfg.get("out_path", "out/report.json")
+    repair_flag = bool(cfg.get("repair_op", False)) if repair_op is None else bool(repair_op)
+    constrained_flag = bool(cfg.get("constrained_op", True)) if constrained_op is None else bool(constrained_op)
+    min_tokens = int(cfg.get("min_proof_tokens", 0)) if min_proof_tokens is None else int(min_proof_tokens)
+    max_tokens = cfg.get("max_proof_tokens")
+    if max_proof_tokens is not None:
+        max_tokens = int(max_proof_tokens)
     report = {
-        "schema": run_eval(schema_path, ckpt, out_path="out/schema_report.json", device=device, log_every=log_every),
-        "math": run_eval(math_path, ckpt, out_path="out/math_report.json", device=device, log_every=log_every),
-        "csp": run_eval(csp_path, ckpt, out_path="out/csp_report.json", device=device, log_every=log_every),
+        "schema": run_eval(
+            schema_path,
+            ckpt,
+            out_path="out/schema_report.json",
+            device=device,
+            log_every=log_every,
+            repair_op=repair_flag,
+            constrained_op=constrained_flag,
+            min_proof_tokens=min_tokens,
+            max_proof_tokens=max_tokens,
+        ),
+        "math": run_eval(
+            math_path,
+            ckpt,
+            out_path="out/math_report.json",
+            device=device,
+            log_every=log_every,
+            repair_op=repair_flag,
+            constrained_op=constrained_flag,
+            min_proof_tokens=min_tokens,
+            max_proof_tokens=max_tokens,
+        ),
+        "csp": run_eval(
+            csp_path,
+            ckpt,
+            out_path="out/csp_report.json",
+            device=device,
+            log_every=log_every,
+            repair_op=repair_flag,
+            constrained_op=constrained_flag,
+            min_proof_tokens=min_tokens,
+            max_proof_tokens=max_tokens,
+        ),
     }
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

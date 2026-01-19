@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import re
+from fractions import Fraction
 from typing import Any
 
 from fc.dsl.program import Instruction, Program
@@ -27,35 +29,61 @@ def _extract_by_key(text: str, key: str, stop: str | None = None) -> str | None:
     return None
 
 
+_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_FRAC_RE = re.compile(r"^\s*([+-]?\d+)\s*/\s*([+-]?\d+)\s*$")
+_DECIMAL_RE = re.compile(r"^\s*([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))\s*$")
+
+
+def _decimal_to_fraction(text: str) -> Fraction | None:
+    match = _DECIMAL_RE.match(text)
+    if not match:
+        return None
+    sign, whole, frac_a, frac_b = match.groups()
+    frac = frac_b if frac_b is not None else (frac_a or "")
+    whole = whole or "0"
+    if not frac:
+        val = int(whole)
+        return Fraction(-val if sign == "-" else val, 1)
+    num = int(f"{whole}{frac}")
+    if sign == "-":
+        num = -num
+    return Fraction(num, 10 ** len(frac))
+
+
 def _extract_int(text: str, key: str | None, index: int | None, stop: str | None) -> int | None:
     if key is not None:
         val = _extract_by_key(text, key, stop=stop)
         if val is None:
             return None
-        digits = re.findall(r"-?\d+", val)
-        if not digits:
+        nums = _NUM_RE.findall(val)
+        if not nums:
             return None
-        return int(digits[0])
-    ints = re.findall(r"-?\d+", text)
-    if index is None or index >= len(ints):
+        frac = _decimal_to_fraction(nums[0])
+        if frac is None or frac.denominator != 1:
+            return None
+        return int(frac.numerator)
+    nums = _NUM_RE.findall(text)
+    if index is None or index >= len(nums):
         return None
-    return int(ints[index])
+    frac = _decimal_to_fraction(nums[index])
+    if frac is None or frac.denominator != 1:
+        return None
+    return int(frac.numerator)
 
 
-def _extract_float(text: str, key: str | None, index: int | None, stop: str | None) -> float | None:
-    pattern = r"-?\d+(?:\.\d+)?"
+def _extract_float(text: str, key: str | None, index: int | None, stop: str | None) -> Fraction | None:
     if key is not None:
         val = _extract_by_key(text, key, stop=stop)
         if val is None:
             return None
-        nums = re.findall(pattern, val)
+        nums = _NUM_RE.findall(val)
         if not nums:
             return None
-        return float(nums[0])
-    nums = re.findall(pattern, text)
+        return _decimal_to_fraction(nums[0])
+    nums = _NUM_RE.findall(text)
     if index is None or index >= len(nums):
         return None
-    return float(nums[index])
+    return _decimal_to_fraction(nums[index])
 
 
 def _extract_str(text: str, key: str | None, stop: str | None) -> str | None:
@@ -80,23 +108,25 @@ def _parse_constraints(text: str) -> list[tuple[str, str]]:
 
 def _topo_order(tasks: dict[str, int], constraints: list[tuple[str, str]]) -> tuple[list[str], bool]:
     # Kahn's algorithm for precedence ordering.
-    # Tie-break alphabetically so orbits that reorder tasks stay invariant.
+    # Tie-break by task insertion order to match PTv1 runtime.
     preds: dict[str, set[str]] = {t: set() for t in tasks}
     succs: dict[str, set[str]] = {t: set() for t in tasks}
     for a, b in constraints:
         if a in tasks and b in tasks:
             preds[b].add(a)
             succs[a].add(b)
+    rank = {t: idx for idx, t in enumerate(tasks.keys())}
     queue = [t for t, ps in preds.items() if not ps]
+    queue.sort(key=lambda k: rank[k])
     order: list[str] = []
     while queue:
-        node = sorted(queue)[0]
-        queue.remove(node)
+        node = queue.pop(0)
         order.append(node)
         for nxt in list(succs[node]):
             preds[nxt].discard(node)
             if not preds[nxt]:
                 queue.append(nxt)
+        queue.sort(key=lambda k: rank[k])
     ok = len(order) == len(tasks)
     return order, ok
 
@@ -125,16 +155,24 @@ def _resolve_value(state: dict[str, Any], value: Any) -> Any:
     return value
 
 
-def _coerce_number(value: Any) -> int | float | None:
-    if isinstance(value, (int, float)):
+def _coerce_number(value: Any) -> int | Fraction | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Fraction):
         return value
-    if isinstance(value, str):
-        try:
-            if "." in value:
-                return float(value)
-            return int(value)
-        except ValueError:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
             return None
+        return Fraction(value).limit_denominator(10**12)
+    if isinstance(value, str):
+        match = _FRAC_RE.match(value)
+        if match:
+            n, d = match.groups()
+            return Fraction(int(n), int(d))
+        frac = _decimal_to_fraction(value)
+        return frac
     return None
 
 
@@ -211,14 +249,18 @@ class Interpreter:
                 res = aval / bval if bval != 0 else float("nan")
             else:
                 return None
+            if isinstance(res, Fraction) and res.denominator == 1:
+                res = int(res.numerator)
             if inst.dest:
                 state[inst.dest] = res
             return res
         if op in {"ADD", "SUB", "MUL", "DIV"}:
             a = inst.args.get("a")
             b = inst.args.get("b")
-            aval = state.get(a, a)
-            bval = state.get(b, b)
+            aval = _coerce_number(state.get(a, a))
+            bval = _coerce_number(state.get(b, b))
+            if aval is None or bval is None:
+                return None
             if op == "ADD":
                 res = aval + bval
             elif op == "SUB":
@@ -227,6 +269,8 @@ class Interpreter:
                 res = aval * bval
             else:
                 res = aval / bval if bval != 0 else float("nan")
+            if isinstance(res, Fraction) and res.denominator == 1:
+                res = int(res.numerator)
             if inst.dest:
                 state[inst.dest] = res
             return res
@@ -274,6 +318,8 @@ class Interpreter:
             if val is None and "result" in state:
                 val = state["result"]
             val = _resolve_value(state, val)
+            if isinstance(val, Fraction) and val.denominator == 1:
+                val = int(val.numerator)
             state["output"] = val
             return val
         if op == "EMIT_SCHEDULE":

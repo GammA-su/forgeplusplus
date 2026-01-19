@@ -26,7 +26,7 @@ def _tag_example(domain: str, ex):
 
 @app.command()
 def main(
-    n: int = typer.Option(50, "--n"),
+    n: int = typer.Option(8000, "--n"),
     orbits: int = typer.Option(-1, "--orbits"),
     flips: int = typer.Option(-1, "--flips"),
     seed: int = typer.Option(123, "--seed"),

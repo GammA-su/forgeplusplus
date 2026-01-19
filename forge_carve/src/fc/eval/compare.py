@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import torch
 
@@ -20,6 +20,10 @@ from fc.eval.metrics import flip_output_pass, orbit_output_pass
 from fc.train.answer import AnswerVocab, parse_answer
 from fc.train.data import Example, TextVocab
 from fc.util.jsonl import read_jsonl
+from fc.util.constrained_decode import greedy_decode_with_opcode_mask
+from fc.util.opcode_repair import repair_invalid_opcodes
+from fc.util.runtime_solve import runtime_solve
+from fc.util.vocab_identity import assert_vocab_match
 from fc.verify.mesh import VerifierMesh
 
 CONF_THRESHOLD = 0.8
@@ -182,13 +186,47 @@ def _predict_forge(
     max_text_len: int,
     device: torch.device,
     interp: Interpreter,
+    constraints: list[dict[str, Any]] | None = None,
+    *,
+    repair_op: bool = False,
+    constrained_op: bool = True,
+    min_proof_tokens: int = 0,
+    max_proof_tokens: int | None = None,
+    record_decode_stats: Callable[[Any], None] | None = None,
+    log_repair: Callable[[str], None] | None = None,
 ) -> tuple[Any, Any]:
     input_ids = torch.tensor([text_vocab.encode(text, max_text_len)], dtype=torch.long, device=device)
     with torch.inference_mode():
         outputs = model(input_ids)
-    pred_ids = torch.argmax(outputs["logits"], dim=-1)[0].detach().cpu().tolist()
+    logits_seq = outputs["logits"][0].detach()
+    pred_ids, decode_stats = greedy_decode_with_opcode_mask(
+        logits_seq,
+        prog_vocab,
+        enforce_opcode=constrained_op,
+        min_tokens=min_proof_tokens,
+        max_tokens=max_proof_tokens,
+        return_stats=True,
+    )
+    if record_decode_stats is not None:
+        record_decode_stats(decode_stats)
     program = decode_program(pred_ids, prog_vocab)
     out, _, _ = interp.execute(program, text)
+    if out is None and repair_op:
+        proof_tokens = [prog_vocab.decode(i) for i in pred_ids]
+        runtime_out, failure = runtime_solve(text, constraints or [], proof_tokens, return_error=True)
+        if failure is not None and failure.code == "PARSE_FAIL":
+            repaired_ids, did_repair = repair_invalid_opcodes(
+                pred_ids,
+                logits_seq,
+                prog_vocab,
+                log_fn=log_repair,
+            )
+            if did_repair:
+                repaired_tokens = [prog_vocab.decode(i) for i in repaired_ids]
+                runtime_out, _ = runtime_solve(text, constraints or [], repaired_tokens, return_error=True)
+                if runtime_out is not None:
+                    out = runtime_out
+                    program = decode_program(repaired_ids, prog_vocab)
     return program, out
 
 
@@ -196,11 +234,27 @@ def evaluate_forge(
     examples: list[Example],
     ckpt_path: str,
     device: str | torch.device | None = None,
+    *,
+    repair_op: bool = False,
+    constrained_op: bool = True,
+    min_proof_tokens: int = 0,
+    max_proof_tokens: int | None = None,
 ) -> dict[str, float]:
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = ckpt["config"]
     text_vocab = _load_text_vocab(ckpt["text_vocab"])
-    prog_vocab = _load_prog_vocab(ckpt["prog_vocab"])
+    prog_vocab_map = ckpt["prog_vocab"]
+    prog_vocab = _load_prog_vocab(prog_vocab_map)
+    prog_vocab_path = Path(ckpt_path).resolve().parent / "prog_vocab.json"
+    if prog_vocab_path.exists():
+        disk_map = json.loads(prog_vocab_path.read_text(encoding="utf-8"))
+        if isinstance(disk_map, dict):
+            assert_vocab_match(
+                prog_vocab_map,
+                disk_map,
+                expected_label="ckpt.prog_vocab",
+                actual_label=str(prog_vocab_path),
+            )
     bcfg = BackboneConfig(vocab_size=cfg["text_vocab_size"], **cfg["backbone"])
     scfg = SlotConfig(**cfg["slots"])
     pcfg = PrimalDualConfig(**cfg["primal_dual"])
@@ -226,28 +280,99 @@ def evaluate_forge(
     flip_ok = []
     confs = []
     max_text_len = cfg["train"]["max_text_len"]
+    eos_pos_counts: dict[int, int] = {}
+    trunc_count = 0
+
+    def _record_decode_stats(stats: Any) -> None:
+        nonlocal trunc_count
+        if stats is None:
+            return
+        eos_pos = getattr(stats, "eos_pos", None)
+        if eos_pos is None:
+            trunc_count += 1
+            return
+        eos_pos_counts[eos_pos] = eos_pos_counts.get(eos_pos, 0) + 1
 
     for idx, ex in enumerate(examples):
         _log_eval_progress("forge", idx, len(examples), ex.domain)
-        prog, out = _predict_forge(model, text_vocab, prog_vocab, ex.x, max_text_len, torch_device, interp)
+        constraints = [
+            c.model_dump() if hasattr(c, "model_dump") else c for c in (ex.constraints or [])
+        ]
+        log_repair = (lambda msg: logger.info(msg)) if repair_op else None
+        prog, out = _predict_forge(
+            model,
+            text_vocab,
+            prog_vocab,
+            ex.x,
+            max_text_len,
+            torch_device,
+            interp,
+            constraints,
+            repair_op=repair_op,
+            constrained_op=constrained_op,
+            min_proof_tokens=min_proof_tokens,
+            max_proof_tokens=max_proof_tokens,
+            record_decode_stats=_record_decode_stats,
+            log_repair=log_repair,
+        )
         report = mesh.run(ex.x, prog, out, domain=ex.domain, constraints=ex.constraints)
         confs.append(_formal_confidence(mesh, report))
         correct.append(outputs_equivalent(out, ex.y))
 
         orbit_execs = []
         for orb in ex.orbit:
-            _, o_out = _predict_forge(model, text_vocab, prog_vocab, orb.x, max_text_len, torch_device, interp)
+            _, o_out = _predict_forge(
+                model,
+                text_vocab,
+                prog_vocab,
+                orb.x,
+                max_text_len,
+                torch_device,
+                interp,
+                constraints,
+                repair_op=repair_op,
+                constrained_op=constrained_op,
+                min_proof_tokens=min_proof_tokens,
+                max_proof_tokens=max_proof_tokens,
+                record_decode_stats=_record_decode_stats,
+                log_repair=log_repair,
+            )
             orbit_execs.append(o_out)
         orbit_ok.append(orbit_output_pass(out, orbit_execs))
 
         flip_execs = []
         flip_ys = []
         for flip in ex.flips:
-            _, f_out = _predict_forge(model, text_vocab, prog_vocab, flip.x, max_text_len, torch_device, interp)
+            _, f_out = _predict_forge(
+                model,
+                text_vocab,
+                prog_vocab,
+                flip.x,
+                max_text_len,
+                torch_device,
+                interp,
+                constraints,
+                repair_op=repair_op,
+                constrained_op=constrained_op,
+                min_proof_tokens=min_proof_tokens,
+                max_proof_tokens=max_proof_tokens,
+                record_decode_stats=_record_decode_stats,
+                log_repair=log_repair,
+            )
             flip_execs.append(f_out)
             flip_ys.append(flip.y)
         flip_ok.append(flip_output_pass(out, ex.y, flip_execs, flip_ys))
 
+    if eos_pos_counts:
+        ordered = sorted(eos_pos_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        dist = ", ".join([f"{pos}:{count}" for pos, count in ordered])
+        logger.info(
+            "eval_compare_decode eos_pos_top=%s trunc_by_maxlen=%d min_tokens=%d max_tokens=%s",
+            dist,
+            trunc_count,
+            min_proof_tokens,
+            str(max_proof_tokens),
+        )
     return {
         "verified_accuracy": _mean(correct),
         "orbit_invariance": _mean(orbit_ok),
@@ -265,6 +390,10 @@ def run_compare(
     forge_ckpt: str | None = None,
     ablation_ckpt: str | None = None,
     device: str | torch.device | None = None,
+    repair_op: bool = False,
+    constrained_op: bool = True,
+    min_proof_tokens: int = 0,
+    max_proof_tokens: int | None = None,
 ) -> dict[str, Any]:
     examples = _load_examples(schema_path, math_path, csp_path)
     grouped = _split_by_domain(examples)
@@ -279,20 +408,84 @@ def run_compare(
             "csp": evaluate_baseline(grouped["csp"], baseline_ckpt, device=device),
         }
     if forge_ckpt:
-        forge_overall = evaluate_forge(examples, forge_ckpt, device=device)
+        forge_overall = evaluate_forge(
+            examples,
+            forge_ckpt,
+            device=device,
+            repair_op=repair_op,
+            constrained_op=constrained_op,
+            min_proof_tokens=min_proof_tokens,
+            max_proof_tokens=max_proof_tokens,
+        )
         report["forge"] = {
             "overall": forge_overall,
-            "schema": evaluate_forge(grouped["schema"], forge_ckpt, device=device),
-            "math": evaluate_forge(grouped["math"], forge_ckpt, device=device),
-            "csp": evaluate_forge(grouped["csp"], forge_ckpt, device=device),
+            "schema": evaluate_forge(
+                grouped["schema"],
+                forge_ckpt,
+                device=device,
+                repair_op=repair_op,
+                constrained_op=constrained_op,
+                min_proof_tokens=min_proof_tokens,
+                max_proof_tokens=max_proof_tokens,
+            ),
+            "math": evaluate_forge(
+                grouped["math"],
+                forge_ckpt,
+                device=device,
+                repair_op=repair_op,
+                constrained_op=constrained_op,
+                min_proof_tokens=min_proof_tokens,
+                max_proof_tokens=max_proof_tokens,
+            ),
+            "csp": evaluate_forge(
+                grouped["csp"],
+                forge_ckpt,
+                device=device,
+                repair_op=repair_op,
+                constrained_op=constrained_op,
+                min_proof_tokens=min_proof_tokens,
+                max_proof_tokens=max_proof_tokens,
+            ),
         }
     if ablation_ckpt:
-        ablation_overall = evaluate_forge(examples, ablation_ckpt, device=device)
+        ablation_overall = evaluate_forge(
+            examples,
+            ablation_ckpt,
+            device=device,
+            repair_op=repair_op,
+            constrained_op=constrained_op,
+            min_proof_tokens=min_proof_tokens,
+            max_proof_tokens=max_proof_tokens,
+        )
         report["ablation"] = {
             "overall": ablation_overall,
-            "schema": evaluate_forge(grouped["schema"], ablation_ckpt, device=device),
-            "math": evaluate_forge(grouped["math"], ablation_ckpt, device=device),
-            "csp": evaluate_forge(grouped["csp"], ablation_ckpt, device=device),
+            "schema": evaluate_forge(
+                grouped["schema"],
+                ablation_ckpt,
+                device=device,
+                repair_op=repair_op,
+                constrained_op=constrained_op,
+                min_proof_tokens=min_proof_tokens,
+                max_proof_tokens=max_proof_tokens,
+            ),
+            "math": evaluate_forge(
+                grouped["math"],
+                ablation_ckpt,
+                device=device,
+                repair_op=repair_op,
+                constrained_op=constrained_op,
+                min_proof_tokens=min_proof_tokens,
+                max_proof_tokens=max_proof_tokens,
+            ),
+            "csp": evaluate_forge(
+                grouped["csp"],
+                ablation_ckpt,
+                device=device,
+                repair_op=repair_op,
+                constrained_op=constrained_op,
+                min_proof_tokens=min_proof_tokens,
+                max_proof_tokens=max_proof_tokens,
+            ),
         }
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

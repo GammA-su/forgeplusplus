@@ -5,6 +5,7 @@ from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 import re
 from collections import defaultdict, deque
+import math
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,25 @@ class Instr:
     args: Dict[str, Any]
 
 
+_DECIMAL_RE = re.compile(r"^\s*([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))\s*$")
+
+
+def _decimal_to_fraction(text: str) -> Fraction:
+    match = _DECIMAL_RE.match(text)
+    if not match:
+        raise ValueError(f"bad decimal: {text!r}")
+    sign, whole, frac_a, frac_b = match.groups()
+    frac = frac_b if frac_b is not None else (frac_a or "")
+    whole = whole or "0"
+    if not frac:
+        val = int(whole)
+        return Fraction(-val if sign == "-" else val, 1)
+    num = int(f"{whole}{frac}")
+    if sign == "-":
+        num = -num
+    return Fraction(num, 10 ** len(frac))
+
+
 def _parse_value(tok: str) -> Any:
     # token formats: STR:foo, INT:0, FLOAT:9.0, BOOL:true
     if tok.startswith("STR:"):
@@ -21,7 +41,7 @@ def _parse_value(tok: str) -> Any:
     if tok.startswith("INT:"):
         return int(tok[4:])
     if tok.startswith("FLOAT:"):
-        return float(tok[6:])
+        return _decimal_to_fraction(tok[6:])
     if tok.startswith("BOOL:"):
         v = tok[5:].lower()
         if v in ("true", "1", "yes"):
@@ -31,6 +51,36 @@ def _parse_value(tok: str) -> Any:
         raise ValueError(f"bad BOOL token: {tok}")
     # fallback: raw token
     return tok
+
+
+def _parse_value_stream(tokens: List[str], idx: int) -> Tuple[Any, int]:
+    tok = tokens[idx]
+    if tok == "LIST_START":
+        items: List[Any] = []
+        idx += 1
+        while tokens[idx] != "LIST_END":
+            if tokens[idx] == "SEP":
+                idx += 1
+                continue
+            item, idx = _parse_value_stream(tokens, idx)
+            items.append(item)
+        return items, idx + 1
+    if tok == "DICT_START":
+        data: Dict[str, Any] = {}
+        idx += 1
+        while tokens[idx] != "DICT_END":
+            if tokens[idx] == "SEP":
+                idx += 1
+                continue
+            key_val, idx = _parse_value_stream(tokens, idx)
+            if tokens[idx] == "SEP":
+                idx += 1
+            val, idx = _parse_value_stream(tokens, idx)
+            data[str(key_val)] = val
+            if tokens[idx] == "SEP":
+                idx += 1
+        return data, idx + 1
+    return _parse_value(tok), idx + 1
 
 
 def parse_tokens(tokens: List[str]) -> List[Instr]:
@@ -88,9 +138,9 @@ def parse_tokens(tokens: List[str]) -> List[Instr]:
             if tokens[i] != "VAL":
                 raise ValueError(f"ARG {key} missing VAL, got {tokens[i]}")
             i += 1
-            val_tok = tokens[i]
-            i += 1
-            args[key] = _parse_value(val_tok)
+            val, next_idx = _parse_value_stream(tokens, i)
+            i = next_idx
+            args[key] = val
 
         out.append(Instr(op=op, dest=dest, args=args))
 
@@ -98,10 +148,119 @@ def parse_tokens(tokens: List[str]) -> List[Instr]:
 
 
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_INT_RE = re.compile(r"-?\d+")
 
 
 def _extract_numbers(text: str) -> List[str]:
     return _NUM_RE.findall(text)
+
+def _extract_ints(text: str) -> List[str]:
+    return _INT_RE.findall(text)
+
+
+def _normalize_stop(stop: str | None) -> str | None:
+    if stop is None:
+        return None
+    if stop in {"\\n", "newline", "line"}:
+        return "\n"
+    return stop
+
+
+def _extract_by_key(text: str, key: str, stop: str | None = None) -> str | None:
+    stop = _normalize_stop(stop)
+    if stop:
+        stop_pat = re.escape(stop)
+        pattern = rf"{re.escape(key)}\s*(?:[:=]|is)\s*([^{stop_pat}]+)"
+    else:
+        pattern = rf"{re.escape(key)}\s*(?:[:=]|is)\s*([^\n;,.]+)"
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _extract_int(
+    text: str,
+    key: str | None,
+    index: int | None,
+    stop: str | None,
+) -> int | None:
+    if key is not None:
+        val = _extract_by_key(text, key, stop=stop)
+        if val is None:
+            return None
+        nums = _NUM_RE.findall(val)
+        if not nums:
+            return None
+        try:
+            frac = _decimal_to_fraction(nums[0])
+        except ValueError:
+            return None
+        if frac.denominator != 1:
+            return None
+        return int(frac.numerator)
+    nums = _NUM_RE.findall(text)
+    if index is None or index >= len(nums):
+        return None
+    try:
+        frac = _decimal_to_fraction(nums[index])
+    except ValueError:
+        return None
+    if frac.denominator != 1:
+        return None
+    return int(frac.numerator)
+
+
+def _extract_float(
+    text: str,
+    key: str | None,
+    index: int | None,
+    stop: str | None,
+) -> Fraction | None:
+    if key is not None:
+        val = _extract_by_key(text, key, stop=stop)
+        if val is None:
+            return None
+        nums = _NUM_RE.findall(val)
+        if not nums:
+            return None
+        try:
+            return _decimal_to_fraction(nums[0])
+        except ValueError:
+            return None
+    nums = _NUM_RE.findall(text)
+    if index is None or index >= len(nums):
+        return None
+    try:
+        return _decimal_to_fraction(nums[index])
+    except ValueError:
+        return None
+
+
+def _extract_str(text: str, key: str | None, stop: str | None) -> str | None:
+    if key is not None:
+        val = _extract_by_key(text, key, stop=stop)
+        if val is None:
+            return None
+        return val.strip()
+    return None
+
+
+def _coerce_number(v: Any) -> Any:
+    if isinstance(v, Fraction):
+        return v
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            return v
+        return Fraction(v).limit_denominator(10**12)
+    if isinstance(v, str):
+        try:
+            return _decimal_to_fraction(v)
+        except ValueError:
+            return v
+    return v
 
 
 def _topo_order(tasks: Dict[str, int], edges: List[Tuple[str, str]]) -> Optional[List[str]]:
@@ -167,6 +326,7 @@ class PTv1Runtime:
 
         prog = parse_tokens(tokens)
         last_emit: Any = None
+        last_value: Any = None
 
         for ins in prog:
             op = ins.op
@@ -174,20 +334,41 @@ class PTv1Runtime:
             args = ins.args
 
             if op == "EXTRACT_INT":
-                nums = _extract_numbers(env["x"])
-                idx = int(args.get("index", 0))
-                val = int(float(nums[idx]))
+                key = args.get("key")
+                index = args.get("index")
+                stop = args.get("stop")
+                idx = int(index) if index is not None else None
+                val = _extract_int(env["x"], key, idx, stop)
                 if dest is None:
                     raise ValueError("EXTRACT_INT missing DEST")
+                if val is None:
+                    raise ValueError("EXTRACT_INT missing value")
                 env[dest] = val
+                last_value = val
 
             elif op == "EXTRACT_FLOAT":
-                nums = _extract_numbers(env["x"])
-                idx = int(args.get("index", 0))
-                val = float(nums[idx])
+                key = args.get("key")
+                index = args.get("index")
+                stop = args.get("stop")
+                idx = int(index) if index is not None else None
+                val = _extract_float(env["x"], key, idx, stop)
                 if dest is None:
                     raise ValueError("EXTRACT_FLOAT missing DEST")
+                if val is None:
+                    raise ValueError("EXTRACT_FLOAT missing value")
                 env[dest] = val
+                last_value = val
+
+            elif op == "EXTRACT_STR":
+                key = args.get("key")
+                stop = args.get("stop")
+                val = _extract_str(env["x"], key, stop)
+                if dest is None:
+                    raise ValueError("EXTRACT_STR missing DEST")
+                if val is None:
+                    raise ValueError("EXTRACT_STR missing value")
+                env[dest] = val
+                last_value = val
 
             elif op == "APPLY_ARITH":
                 # args a,b can be references (STR:a) or literals
@@ -198,15 +379,20 @@ class PTv1Runtime:
                 a = env[a_ref] if isinstance(a_ref, str) and a_ref in env else a_ref
                 b = env[b_ref] if isinstance(b_ref, str) and b_ref in env else b_ref
                 opv = env[op_sym] if isinstance(op_sym, str) and op_sym in env else op_sym
+                a = _coerce_number(a)
+                b = _coerce_number(b)
 
-                if opv == "+":
+                opv = str(opv).lower()
+                if opv in {"+", "add", "plus"}:
                     r = a + b
-                elif opv == "-":
+                elif opv in {"-", "sub", "minus"}:
                     r = a - b
-                elif opv == "*":
+                elif opv in {"*", "mul", "times", "x"}:
                     r = a * b
-                elif opv == "/":
-                    if isinstance(a, (int, Fraction)) and isinstance(b, (int, Fraction)):
+                elif opv in {"/", "div", "divide"}:
+                    if b == 0:
+                        r = float("nan")
+                    elif isinstance(a, (int, Fraction)) and isinstance(b, (int, Fraction)):
                         r = Fraction(a, b)
                     else:
                         r = a / b
@@ -221,6 +407,7 @@ class PTv1Runtime:
                 if dest is None:
                     raise ValueError("APPLY_ARITH missing DEST")
                 env[dest] = r
+                last_value = r
 
             elif op == "APPLY_TOPO":
                 tasks = env.get("tasks") or {}
@@ -233,6 +420,7 @@ class PTv1Runtime:
                 if dest is None:
                     raise ValueError("APPLY_TOPO missing DEST")
                 env[dest] = order
+                last_value = order
 
             elif op == "APPLY_CUMSUM":
                 if env.get("status") != "ok":
@@ -250,18 +438,34 @@ class PTv1Runtime:
                 if dest is None:
                     raise ValueError("APPLY_CUMSUM missing DEST")
                 env[dest] = sched
+                last_value = sched
 
             elif op == "EMIT_NUM":
                 vref = args.get("value")
                 v = env[vref] if isinstance(vref, str) and vref in env else vref
                 last_emit = v
+                last_value = v
 
             elif op == "EMIT_SCHEDULE":
                 sched = env.get("schedule") or {}
                 status = env.get("status", "ok")
                 last_emit = {"schedule": sched, "status": status}
+                last_value = last_emit
+
+            elif op == "EMIT":
+                fields = args.get("fields", {})
+                out: Dict[str, Any] = {}
+                for key, val in fields.items():
+                    if isinstance(val, str) and val in env:
+                        out[key] = env[val]
+                    else:
+                        out[key] = val
+                last_emit = out
+                last_value = out
 
             else:
                 raise ValueError(f"unsupported op: {op}")
 
-        return last_emit
+        if last_emit is not None:
+            return last_emit
+        return last_value
