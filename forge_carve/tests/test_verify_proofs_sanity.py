@@ -1,9 +1,5 @@
-import hashlib
-import json
 import subprocess, sys, textwrap, tempfile
 from pathlib import Path
-
-from fc.util.tags import DOMAIN_TAGS
 
 def run_verify(path: str) -> tuple[int,int,str,str]:
     r = subprocess.run([sys.executable, "scripts/verify_proofs.py", path],
@@ -33,35 +29,23 @@ def test_rejects_junk_rows():
         assert checked is not None and bad is not None, f"no summary printed. out={out!r} err={err!r}"
         assert bad > 0, f"junk accepted: {out} err={err}"
 
-def _hash_tokens(tokens: list[str]) -> str:
-    payload = json.dumps(tokens, ensure_ascii=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
 def test_rejects_wrong_y_when_schema_present():
     # This assumes your schema requires x,y,domain_tag. Adjust if needed.
-    tokens = [
-        "<BOS>", "BEGIN",
-        "OP", "EXTRACT_INT", "DEST", "STR:a", "ARG", "index", "VAL", "INT:0",
-        "OP", "EXTRACT_INT", "DEST", "STR:b", "ARG", "index", "VAL", "INT:1",
-        "OP", "APPLY_ARITH", "DEST", "STR:result", "ARG", "a", "VAL", "STR:a", "ARG", "b", "VAL", "STR:b",
-        "ARG", "op", "VAL", "STR:+",
-        "OP", "EMIT_NUM", "ARG", "value", "VAL", "STR:result",
-        "END", "<EOS>",
-    ]
     row_ok = {
         "id": "t0",
-        "domain_tag": DOMAIN_TAGS["math"],
-        "x": "What is 7 plus 7?",
-        "y": 14,
+        "domain_tag": "math",
+        "x": "1+1",
+        "y": 2,
         "constraints": [],
-        "proof": {"tokens": tokens, "sha256": _hash_tokens(tokens)},
+        "domain": {},
+        "proof": {"tokens": ["dummy"]},
         "orbit": [],
         "flips": []
     }
     row_bad = dict(row_ok)
     row_bad["y"] = 999
 
+    import json
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         path = write(tmp, "two.jsonl", [json.dumps(row_ok), json.dumps(row_bad)])

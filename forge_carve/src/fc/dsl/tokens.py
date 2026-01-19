@@ -41,7 +41,7 @@ ARG_KEYS = [
 
 NAMES = ["Alice", "Bob", "Cara", "Dion", "Eve", "Fay"]
 CITIES = ["Paris", "Berlin", "Oslo", "Lima", "Riga", "Pune"]
-TASKS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+TASKS = [chr(code) for code in range(ord("A"), ord("Z") + 1)]
 OP_SYMBOLS = ["+", "-", "*", "/"]
 SYMBOLS = [
     "name",
@@ -51,6 +51,7 @@ SYMBOLS = [
     "b",
     "c",
     "d",
+    "e",
     "result",
     "t0",
     "t1",

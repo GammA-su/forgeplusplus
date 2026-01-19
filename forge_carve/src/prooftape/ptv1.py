@@ -106,10 +106,12 @@ def _extract_numbers(text: str) -> List[str]:
 def _topo_order(tasks: Dict[str, int], edges: List[Tuple[str, str]]) -> Optional[List[str]]:
     """
     Deterministic Kahn topo sort.
-    Tie-break: alphabetical order for orbit invariance.
+    Tie-break: insertion order of `tasks` dict (JSON preserves object order).
     Return None on cycle.
     """
     nodes = list(tasks.keys())
+    rank = {k: idx for idx, k in enumerate(nodes)}
+
     adj: Dict[str, List[str]] = defaultdict(list)
     indeg: Dict[str, int] = {k: 0 for k in nodes}
 
@@ -121,7 +123,7 @@ def _topo_order(tasks: Dict[str, int], edges: List[Tuple[str, str]]) -> Optional
         indeg[v] += 1
 
     q = [k for k in nodes if indeg[k] == 0]
-    q.sort()
+    q.sort(key=lambda k: rank[k])
 
     out: List[str] = []
     while q:
@@ -131,7 +133,7 @@ def _topo_order(tasks: Dict[str, int], edges: List[Tuple[str, str]]) -> Optional
             indeg[v] -= 1
             if indeg[v] == 0:
                 q.append(v)
-        q.sort()
+        q.sort(key=lambda k: rank[k])
 
     if len(out) != len(nodes):
         return None

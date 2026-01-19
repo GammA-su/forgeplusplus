@@ -3,12 +3,14 @@ from __future__ import annotations
 import typer
 
 from fc.dsl.program import Program
-from fc.train.data import generate_dataset, program_to_proof, save_dataset
+from fc.dsl.tokens import build_default_vocab
+from fc.train.data import generate_dataset, program_to_proof, proof_to_program, save_dataset
 from fc.util.tags import DOMAIN_TAGS, apply_domain_tag
 from fc.util.logging import configure_logging, get_logger
 from fc.util.runtime import configure_runtime
 
 app = typer.Typer(add_completion=False)
+_PROG_VOCAB = build_default_vocab()
 
 
 def _tag_example(domain: str, ex):
@@ -27,8 +29,13 @@ def _tag_example(domain: str, ex):
 
 def _ensure_proof_tokens(ex):
     if isinstance(ex.proof, dict) and ex.proof.get("dsl") == "PTv1":
-        return ex
-    return ex.model_copy(update={"proof": program_to_proof(Program.from_dict(ex.proof))})
+        proof = ex.proof
+    else:
+        proof = program_to_proof(Program.from_dict(ex.proof))
+    program = proof_to_program(proof, _PROG_VOCAB)
+    if not program.instructions or program.instructions[-1].opcode != "EMIT_NUM":
+        raise ValueError(f"math proof must end with EMIT_NUM, got={program.skeleton()}")
+    return ex.model_copy(update={"proof": proof})
 
 
 @app.command()

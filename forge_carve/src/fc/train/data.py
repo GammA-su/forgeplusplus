@@ -5,6 +5,7 @@ import json
 import math
 import random
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -367,7 +368,7 @@ def generate_schema_example(idx: int, rng: random.Random, orbits: int | None, fl
     )
 
 
-_MATH_LEAF_NAMES = ["a", "b", "c", "d"]
+_MATH_LEAF_NAMES = ["a", "b", "c", "d", "e"]
 _MATH_TEMP_NAMES = ["t0", "t1", "t2"]
 _MATH_OP_WORDS = {"+": "plus", "-": "minus", "*": "times", "/": "divided by"}
 
@@ -444,8 +445,10 @@ def _math_compile_expr(
 def _math_program_from_expr(expr: dict[str, Any]) -> Program:
     ops: list[str] = []
     _math_expr_ops(expr, ops)
-    extract_op = "EXTRACT_FLOAT" if "/" in ops else "EXTRACT_INT"
-    max_idx = max(expr["idx"] for expr in _math_collect_leaves(expr))
+    leaves = _math_collect_leaves(expr)
+    use_float = "/" in ops or any(isinstance(leaf["value"], float) for leaf in leaves)
+    extract_op = "EXTRACT_FLOAT" if use_float else "EXTRACT_INT"
+    max_idx = max(expr["idx"] for expr in leaves)
     if max_idx + 1 > len(_MATH_LEAF_NAMES):
         raise ValueError("math expression too large for leaf names")
     insts: list[Instruction] = []
@@ -463,7 +466,7 @@ def _math_collect_leaves(expr: dict[str, Any]) -> list[dict[str, Any]]:
     return _math_collect_leaves(expr["left"]) + _math_collect_leaves(expr["right"])
 
 
-def _math_build_expr(values: list[int], ops: list[str], grouping: str) -> dict[str, Any]:
+def _math_build_expr(values: list[int | float], ops: list[str], grouping: str) -> dict[str, Any]:
     leaves = [_math_leaf(i, values[i]) for i in range(len(values))]
     if len(values) == 2:
         return _math_node(ops[0], leaves[0], leaves[1])
@@ -485,24 +488,60 @@ def _math_build_expr(values: list[int], ops: list[str], grouping: str) -> dict[s
         left = _math_node(ops[0], leaves[0], leaves[1])
         mid = _math_node(ops[1], left, leaves[2])
         return _math_node(ops[2], mid, leaves[3])
+    if len(values) == 5:
+        if grouping == "right":
+            right = _math_node(ops[3], leaves[3], leaves[4])
+            mid = _math_node(ops[2], leaves[2], right)
+            mid2 = _math_node(ops[1], leaves[1], mid)
+            return _math_node(ops[0], leaves[0], mid2)
+        if grouping == "pair":
+            left = _math_node(ops[0], leaves[0], leaves[1])
+            right = _math_node(ops[2], leaves[2], leaves[3])
+            right2 = _math_node(ops[3], right, leaves[4])
+            return _math_node(ops[1], left, right2)
+        if grouping == "center":
+            left = _math_node(ops[0], leaves[0], _math_node(ops[1], leaves[1], leaves[2]))
+            right = _math_node(ops[3], leaves[3], leaves[4])
+            return _math_node(ops[2], left, right)
+        left = _math_node(ops[0], leaves[0], leaves[1])
+        mid = _math_node(ops[1], left, leaves[2])
+        mid2 = _math_node(ops[2], mid, leaves[3])
+        return _math_node(ops[3], mid2, leaves[4])
     raise ValueError("unsupported expression size")
 
 
+def _sample_math_value(rng: random.Random, num_min: int, num_max: int, allow_float: bool) -> int | float:
+    val = rng.randint(num_min, num_max)
+    if allow_float and rng.random() < 0.25:
+        frac = rng.choice([0.1, 0.2, 0.25, 0.5, 0.75, 0.8, 0.9])
+        sign = -1 if val < 0 else 1
+        if val == 0:
+            sign = -1 if rng.random() < 0.5 else 1
+        val = round(val + sign * frac, 2)
+    return val
+
+
 def generate_math_example(idx: int, rng: random.Random, orbits: int | None, flips: int | None) -> Example:
-    num_min, num_max = -999, 999
-    op_count = rng.choices([1, 2, 3], weights=[0.4, 0.35, 0.25], k=1)[0]
-    values: list[int] = []
+    num_min, num_max = -9999, 9999
+    op_count = rng.choices([2, 3, 4], weights=[0.35, 0.35, 0.3], k=1)[0]
+    values: list[int | float] = []
     ops: list[str] = []
     while True:
         values = []
         ops = rng.choices(["+", "-", "*", "/"], weights=[0.35, 0.25, 0.25, 0.15], k=op_count)
         avoid_zero = "/" in ops
+        allow_float = "/" in ops and rng.random() < 0.5
         for _ in range(op_count + 1):
-            val = rng.randint(num_min, num_max)
-            if avoid_zero and val == 0:
-                val = rng.randint(1, num_max)
+            val = _sample_math_value(rng, num_min, num_max, allow_float)
+            while avoid_zero and abs(val) < 1e-9:
+                val = _sample_math_value(rng, num_min, num_max, allow_float)
             values.append(val)
-        grouping = rng.choice(["left", "right"] if op_count < 3 else ["left", "right", "pair"])
+        if op_count == 2:
+            grouping = rng.choice(["left", "right"])
+        elif op_count == 3:
+            grouping = rng.choice(["left", "right", "pair"])
+        else:
+            grouping = rng.choice(["left", "right", "pair", "center"])
         expr = _math_build_expr(values, ops, grouping)
         try:
             y = _math_expr_eval(expr)
@@ -517,6 +556,10 @@ def generate_math_example(idx: int, rng: random.Random, orbits: int | None, flip
         "What is {expr}?",
         "Evaluate: {expr}.",
         "Solve: {expr}.",
+        "Calculate the value of {expr}.",
+        "Find the result of {expr}.",
+        "Work out {expr}.",
+        "Compute exactly: {expr}.",
     ]
     expr_text = _math_expr_text(expr, rng, root=True)
     x = rng.choice(templates).format(expr=expr_text)
@@ -550,26 +593,47 @@ def _csp_program() -> Program:
 
 
 def generate_csp_example(idx: int, rng: random.Random, orbits: int | None, flips: int | None) -> Example:
-    task_count = rng.randint(4, min(10, len(TASKS)))
+    task_count = rng.randint(4, min(12, len(TASKS)))
     tasks = rng.sample(TASKS, k=task_count)
-    durations = {t: rng.randint(1, 9) for t in tasks}
-    edge_prob = rng.uniform(0.15, 0.5)
+    durations = {t: rng.randint(1, 20) for t in tasks}
+    order = list(tasks)
+    rng.shuffle(order)
+    edge_style = rng.choice(["random", "dense", "sparse", "chain", "fan"])
+    if edge_style == "dense":
+        edge_prob = rng.uniform(0.45, 0.85)
+    elif edge_style == "sparse":
+        edge_prob = rng.uniform(0.05, 0.2)
+    else:
+        edge_prob = rng.uniform(0.15, 0.6)
     cons: list[tuple[str, str]] = []
-    for i in range(task_count):
-        for j in range(i + 1, task_count):
+    if edge_style == "chain":
+        for a, b in zip(order, order[1:]):
+            cons.append((a, b))
+    elif edge_style == "fan":
+        root = order[0]
+        for b in order[1:]:
             if rng.random() < edge_prob:
-                cons.append((tasks[i], tasks[j]))
+                cons.append((root, b))
+    else:
+        for i in range(task_count):
+            for j in range(i + 1, task_count):
+                if rng.random() < edge_prob:
+                    cons.append((order[i], order[j]))
     if not cons and task_count >= 2:
         i = rng.randrange(0, task_count - 1)
         j = rng.randrange(i + 1, task_count)
-        cons.append((tasks[i], tasks[j]))
+        cons.append((order[i], order[j]))
     rng.shuffle(cons)
-    task_part = ",".join(f"{t}={durations[t]}" for t in tasks)
-    cons_part = ",".join(f"{a}<{b}" for a, b in cons)
+    task_sep = rng.choice([",", ", ", "; ", " | "])
+    cons_sep = rng.choice([",", ", ", "; ", " and ", " | "])
+    task_part = task_sep.join(f"{t}={durations[t]}" for t in tasks)
+    cons_part = cons_sep.join(f"{a}<{b}" for a, b in cons)
     templates = [
         "Tasks: {tasks}. Constraints: {cons}.",
         "Schedule tasks {tasks}. Precedence: {cons}.",
         "Given tasks {tasks}, obey constraints {cons}.",
+        "Tasks (durations): {tasks}. Must satisfy: {cons}.",
+        "Plan tasks {tasks} with constraints {cons}.",
     ]
     x = rng.choice(templates).format(tasks=task_part, cons=cons_part)
     x = apply_domain_tag("csp", x)
@@ -666,6 +730,18 @@ def generate_dataset(
             f"data_gen warning domain={domain} requested={n} generated={len(examples)} "
             f"duplicates={duplicates} attempts={attempts}"
         )
+    window = max(1, len(recent_attempts))
+    collision_rate = sum(recent_attempts) / float(window)
+    top = sorted(collision_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    top_repr = []
+    for sig_val, count in top:
+        sig_hash = hashlib.sha1(sig_val.encode("utf-8")).hexdigest()[:8]
+        top_repr.append(f"{sig_hash}:{count}")
+    top_str = ",".join(top_repr)
+    print(
+        f"data_gen summary domain={domain} attempts={attempts} uniques={len(examples)} "
+        f"collision_rate_last_1k={collision_rate:.3f} top_collisions={top_str}"
+    )
     return examples
 
 
@@ -703,8 +779,8 @@ def _collect_proof_tokens(
     proof: dict[str, Any] | None,
     vocab: TokenVocab,
     seen: set[str],
-    missing: set[str],
-    missing_ids: set[int],
+    missing_counts: Counter[str],
+    missing_id_counts: Counter[int],
 ) -> None:
     if not proof:
         return
@@ -714,45 +790,45 @@ def _collect_proof_tokens(
             if isinstance(tok, int):
                 decoded = vocab.decode(tok)
                 if decoded == "<UNK>":
-                    missing_ids.add(tok)
+                    missing_id_counts[tok] += 1
                 else:
                     seen.add(decoded)
                 continue
             tok_str = str(tok)
             seen.add(tok_str)
             if tok_str not in vocab.token_to_id:
-                missing.add(tok_str)
+                missing_counts[tok_str] += 1
         return
     try:
         program = Program.from_dict(proof) if isinstance(proof, dict) else None
     except Exception as exc:
-        missing.add(f"invalid_proof:{exc}")
+        missing_counts[f"invalid_proof:{exc}"] += 1
         return
     if program is None:
         return
     for tok_str in program_to_tokens(program):
         seen.add(tok_str)
         if tok_str not in vocab.token_to_id:
-            missing.add(tok_str)
+            missing_counts[tok_str] += 1
 
 
 def audit_proof_tokens(examples: Iterable[Example] | Iterable[dict[str, Any]]) -> list[str]:
     vocab = build_default_vocab()
     seen: set[str] = set()
-    missing: set[str] = set()
-    missing_ids: set[int] = set()
+    missing_counts: Counter[str] = Counter()
+    missing_id_counts: Counter[int] = Counter()
     for ex in examples:
         proof = ex.proof if isinstance(ex, Example) else ex.get("proof")
-        _collect_proof_tokens(proof, vocab, seen, missing, missing_ids)
-    if missing or missing_ids:
-        sample_missing = sorted(missing)[:10]
-        sample_ids = sorted(missing_ids)[:10]
+        _collect_proof_tokens(proof, vocab, seen, missing_counts, missing_id_counts)
+    if missing_counts or missing_id_counts:
+        sample_missing = missing_counts.most_common(10)
+        sample_ids = missing_id_counts.most_common(10)
         msg = "Unknown proof tokens detected"
-        if missing:
+        if missing_counts:
             msg += f" tokens={sample_missing}"
-        if missing_ids:
+        if missing_id_counts:
             msg += f" token_ids={sample_ids}"
-        msg += f" missing_count={len(missing)} missing_id_count={len(missing_ids)}"
+        msg += f" missing_count={sum(missing_counts.values())} missing_id_count={sum(missing_id_counts.values())}"
         raise ValueError(msg)
     return sorted(seen)
 
