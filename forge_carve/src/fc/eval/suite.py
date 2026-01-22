@@ -27,10 +27,12 @@ from fc.morph.equiv import outputs_equivalent
 from fc.dsl.tokens import TokenVocab
 from fc.train.data import Example, TextVocab
 from fc.util.jsonl import read_jsonl
-from fc.util.vocab_identity import assert_vocab_match
+from fc.util.vocab_identity import assert_vocab_match, vocab_identity
 from fc.util.constrained_decode import greedy_decode_with_opcode_mask
 from fc.util.opcode_repair import repair_invalid_opcodes
+from fc.util.decode_limits import resolve_max_prog_len
 from fc.util.runtime_solve import runtime_solve
+from fc.util.tags import domain_from_tag
 from fc.verify.mesh import VerifierMesh, set_orbit_parallelism
 
 
@@ -43,6 +45,15 @@ def _load_prog_vocab(mapping: dict[str, int]) -> TokenVocab:
     return TokenVocab(token_to_id=mapping, id_to_token=id_to_token)
 
 
+def _truncate_at_eos(ids: list[int], vocab: TokenVocab) -> list[int]:
+    eos_id = vocab.token_to_id.get("<EOS>")
+    if eos_id is None:
+        return ids
+    if eos_id in ids:
+        return ids[: ids.index(eos_id) + 1]
+    return ids
+
+
 def run_eval(
     data_path: str,
     ckpt_path: str,
@@ -52,7 +63,7 @@ def run_eval(
     repair_op: bool = False,
     constrained_op: bool = True,
     min_proof_tokens: int = 0,
-    max_proof_tokens: int | None = None,
+    max_prog_len: int | None = None,
 ) -> dict[str, Any]:
     logger = logging.getLogger(__name__)
     rows = [Example.model_validate(r) for r in read_jsonl(data_path)]
@@ -61,6 +72,19 @@ def run_eval(
     prog_vocab = ckpt["prog_vocab"]
     prog_vocab_obj = _load_prog_vocab(prog_vocab)
     cfg = ckpt["config"]
+    if "prog_vocab_sha256" in ckpt:
+        ckpt_id = vocab_identity(prog_vocab)
+        if ckpt["prog_vocab_sha256"] != ckpt_id.sha256:
+            raise ValueError(
+                "ckpt prog_vocab_sha256 mismatch "
+                f"expected={ckpt_id.sha256} got={ckpt['prog_vocab_sha256']}"
+            )
+    ckpt_max_prog_len = ckpt.get("max_prog_len")
+    if ckpt_max_prog_len is not None and cfg.get("max_prog_len") not in (None, ckpt_max_prog_len):
+        raise ValueError(
+            "ckpt max_prog_len mismatch "
+            f"ckpt={ckpt_max_prog_len} cfg={cfg.get('max_prog_len')}"
+        )
     prog_vocab_path = Path(ckpt_path).resolve().parent / "prog_vocab.json"
     if prog_vocab_path.exists():
         disk_map = json.loads(prog_vocab_path.read_text(encoding="utf-8"))
@@ -113,7 +137,7 @@ def run_eval(
     adv_total = 0
 
     total = len(rows)
-    max_tokens = cfg["max_prog_len"] if max_proof_tokens is None else max(1, int(max_proof_tokens))
+    max_tokens = max(1, resolve_max_prog_len(max_prog_len, cfg, ckpt=ckpt))
     min_tokens = max(0, int(min_proof_tokens))
     eos_pos_counts: dict[int, int] = {}
     trunc_count = 0
@@ -128,7 +152,7 @@ def run_eval(
             return
         eos_pos_counts[eos_pos] = eos_pos_counts.get(eos_pos, 0) + 1
 
-    def _predict(text: str, constraints: list[dict[str, Any]] | None) -> tuple[Program, Any]:
+    def _predict(text: str, constraints: list[dict[str, Any]] | None, domain_tag: str | None) -> tuple[Program, Any]:
         input_ids = torch.tensor(
             [text_vocab.encode(text, cfg["train"]["max_text_len"])],
             dtype=torch.long,
@@ -137,14 +161,17 @@ def run_eval(
         with torch.inference_mode():
             base_out = model(input_ids)
         logits_seq = base_out["logits"][0].detach()
+        domain_hint = domain_tag or domain_from_tag(text)
         pred_ids, decode_stats = greedy_decode_with_opcode_mask(
             logits_seq,
             prog_vocab_obj,
             enforce_opcode=constrained_op,
             min_tokens=min_tokens,
             max_tokens=max_tokens,
+            domain_tag=domain_hint,
             return_stats=True,
         )
+        pred_ids = _truncate_at_eos(pred_ids, prog_vocab_obj)
         _record_decode_stats(decode_stats)
         prog = decode_program(pred_ids, prog_vocab_obj)
         out, _, _ = interp.execute(prog, text)
@@ -172,7 +199,7 @@ def run_eval(
         constraints = [
             c.model_dump() if hasattr(c, "model_dump") else c for c in (ex.constraints or [])
         ]
-        prog, out = _predict(ex.x, constraints)
+        prog, out = _predict(ex.x, constraints, ex.domain_tag)
         orbits = [o.x for o in ex.orbit]
         flips = [f.x for f in ex.flips]
         report = mesh.run(
@@ -203,14 +230,14 @@ def run_eval(
 
         orbit_execs = []
         for otext in orbits:
-            _, orbit_exec = _predict(otext, constraints)
+            _, orbit_exec = _predict(otext, constraints, ex.domain_tag)
             orbit_execs.append(orbit_exec)
         orbit_pass.append(orbit_output_pass(out, orbit_execs))
 
         flip_execs = []
         flip_ys = []
         for fvar in ex.flips:
-            _, flip_exec = _predict(fvar.x, constraints)
+            _, flip_exec = _predict(fvar.x, constraints, ex.domain_tag)
             flip_execs.append(flip_exec)
             flip_ys.append(fvar.y)
         flip_pass.append(flip_output_pass(out, ex.y, flip_execs, flip_ys))
@@ -239,6 +266,11 @@ def run_eval(
             if sum(rep.c[:3]) == 0:
                 adv_success += 1
 
+    logger.info(
+        "eval decode max_prog_len=%d min_proof_tokens=%d",
+        max_tokens,
+        min_tokens,
+    )
     if eos_pos_counts:
         ordered = sorted(eos_pos_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
         dist = ", ".join([f"{pos}:{count}" for pos, count in ordered])
@@ -277,7 +309,7 @@ def run_eval_suite(
     repair_op: bool | None = None,
     constrained_op: bool | None = None,
     min_proof_tokens: int | None = None,
-    max_proof_tokens: int | None = None,
+    max_prog_len: int | None = None,
 ) -> dict[str, Any]:
     cfg = load_eval_config(config_path)
     set_orbit_parallelism(bool(cfg.get("parallel_orbits", False)))
@@ -290,9 +322,7 @@ def run_eval_suite(
     repair_flag = bool(cfg.get("repair_op", False)) if repair_op is None else bool(repair_op)
     constrained_flag = bool(cfg.get("constrained_op", True)) if constrained_op is None else bool(constrained_op)
     min_tokens = int(cfg.get("min_proof_tokens", 0)) if min_proof_tokens is None else int(min_proof_tokens)
-    max_tokens = cfg.get("max_proof_tokens")
-    if max_proof_tokens is not None:
-        max_tokens = int(max_proof_tokens)
+    max_tokens = resolve_max_prog_len(max_prog_len, cfg)
     report = {
         "schema": run_eval(
             schema_path,
@@ -303,7 +333,7 @@ def run_eval_suite(
             repair_op=repair_flag,
             constrained_op=constrained_flag,
             min_proof_tokens=min_tokens,
-            max_proof_tokens=max_tokens,
+            max_prog_len=max_tokens,
         ),
         "math": run_eval(
             math_path,
@@ -314,7 +344,7 @@ def run_eval_suite(
             repair_op=repair_flag,
             constrained_op=constrained_flag,
             min_proof_tokens=min_tokens,
-            max_proof_tokens=max_tokens,
+            max_prog_len=max_tokens,
         ),
         "csp": run_eval(
             csp_path,
@@ -325,7 +355,7 @@ def run_eval_suite(
             repair_op=repair_flag,
             constrained_op=constrained_flag,
             min_proof_tokens=min_tokens,
-            max_proof_tokens=max_tokens,
+            max_prog_len=max_tokens,
         ),
     }
     out_path = Path(out_path)

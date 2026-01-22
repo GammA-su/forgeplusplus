@@ -5,6 +5,23 @@ from typing import Iterable
 from fc.dsl.program import Instruction, Program
 
 
+def _coerce_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text and text.lstrip("+-").isdigit():
+            return int(text)
+        return None
+    return None
+
+
 class ProgramMutator:
     def mutate(self, program: Program) -> list[Program]:
         mutants: list[Program] = []
@@ -39,7 +56,10 @@ class ProgramMutator:
         for i, inst in enumerate(insts):
             if inst.opcode == "EXTRACT_INT" and "index" in inst.args:
                 args = dict(inst.args)
-                args["index"] = int(args["index"]) + 1
+                idx_val = _coerce_int(args.get("index"))
+                if idx_val is None:
+                    continue
+                args["index"] = idx_val + 1
                 new_inst = Instruction(opcode=inst.opcode, args=args, dest=inst.dest)
                 mutants.append(Program(insts[:i] + [new_inst] + insts[i + 1 :]))
         # Drop a constraint-related step (e.g., solver or arithmetic op)

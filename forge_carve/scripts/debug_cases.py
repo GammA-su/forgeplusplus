@@ -17,6 +17,7 @@ from fc.train.data import Example, TextVocab
 from fc.util.constrained_decode import greedy_decode_with_opcode_mask
 from fc.util.jsonl import read_jsonl
 from fc.util.opcode_repair import repair_invalid_opcodes
+from fc.util.decode_limits import resolve_max_prog_len
 from fc.util.proof_repair import longest_valid_prefix, repair_tokens, scan_tokens
 from fc.util.vocab_identity import assert_vocab_match, vocab_identity
 from fc.util.tags import domain_from_tag
@@ -87,6 +88,15 @@ def _special_token_ids(mapping: dict[str, int]) -> dict[str, int | None]:
     return {tok: mapping.get(tok) for tok in ("<PAD>", "<UNK>", "<BOS>", "<EOS>")}
 
 
+def _truncate_at_eos(ids: list[int], vocab: TokenVocab) -> list[int]:
+    eos_id = vocab.token_to_id.get("<EOS>")
+    if eos_id is None:
+        return ids
+    if eos_id in ids:
+        return ids[: ids.index(eos_id) + 1]
+    return ids
+
+
 @app.command()
 def main(
     domain: Domain = typer.Option(..., "--domain"),
@@ -100,7 +110,7 @@ def main(
     repair: bool = typer.Option(False, "--repair"),
     max_repairs: int = typer.Option(5, "--max-repairs"),
     repair_k: int = typer.Option(30, "--repair-k"),
-    max_proof_tokens: int = typer.Option(0, "--max-proof-tokens"),
+    max_prog_len: int = typer.Option(256, "--max-prog-len"),
     min_proof_tokens: int = typer.Option(0, "--min-proof-tokens"),
 ) -> None:
     data_path = data or f"out/data/{domain}.jsonl"
@@ -122,6 +132,11 @@ def main(
 
     if prog_vocab_map:
         ckpt_id = vocab_identity(prog_vocab_map)
+        if "prog_vocab_sha256" in ckpt_data and ckpt_data["prog_vocab_sha256"] != ckpt_id.sha256:
+            raise ValueError(
+                "ckpt prog_vocab_sha256 mismatch "
+                f"expected={ckpt_id.sha256} got={ckpt_data['prog_vocab_sha256']}"
+            )
         print(
             "ckpt_prog_vocab size=%d sha256=%s specials=%s"
             % (len(prog_vocab_map), ckpt_id.sha256, _special_token_ids(prog_vocab_map))
@@ -147,7 +162,7 @@ def main(
         from fc.model.baseline import BaselineConfig, BaselineModel
 
         answer_vocab = _load_answer_vocab(ckpt_data["answer_vocab"])
-        max_answer_len = cfg.get("max_answer_len") or cfg["train"].get("max_answer_len") or cfg.get("max_prog_len", 64)
+        max_answer_len = cfg.get("max_answer_len") or cfg["train"].get("max_answer_len") or cfg.get("max_prog_len", 256)
         bcfg = BackboneConfig(vocab_size=cfg["text_vocab_size"], **cfg["backbone"])
         mcfg = BaselineConfig(
             vocab_size=cfg["text_vocab_size"],
@@ -190,8 +205,17 @@ def main(
 
     stats_fail_pos: dict[int, int] = {}
     stats_eos_pos: dict[int, int] = {}
+    stats_emit_pos: dict[int, int] = {}
     stats_early_eos = 0
     stats_trunc_maxlen = 0
+    resolved_max_tokens = resolve_max_prog_len(max_prog_len, cfg, ckpt=ckpt_data)
+    print(f"resolved_max_prog_len={resolved_max_tokens} min_proof_tokens={min_proof_tokens}")
+    ckpt_max_prog_len = ckpt_data.get("max_prog_len")
+    if ckpt_max_prog_len is not None and cfg.get("max_prog_len") not in (None, ckpt_max_prog_len):
+        raise ValueError(
+            "ckpt max_prog_len mismatch "
+            f"ckpt={ckpt_max_prog_len} cfg={cfg.get('max_prog_len')}"
+        )
 
     for idx, ex in enumerate(rows):
         constraints = [
@@ -204,11 +228,14 @@ def main(
         )
         with torch.inference_mode():
             outputs = model(input_ids)
+        logits_len = outputs.get("logits").shape[1] if isinstance(outputs, dict) and "logits" in outputs else None
 
         program = None
         pred: Any
+        pred_ids_len: int | None = None
         if answer_vocab is not None:
             pred_ids = outputs["answer_ids"][0].detach().cpu().tolist()
+            pred_ids_len = len(pred_ids)
             pred_text = answer_vocab.decode(pred_ids)
             pred = parse_answer(pred_text)
             if pred is None:
@@ -231,16 +258,21 @@ def main(
             if prog_vocab is None:
                 raise SystemExit("Missing prog_vocab for forge checkpoint")
             logits_seq = outputs["logits"][0].detach()
-            max_tokens = max_proof_tokens if max_proof_tokens > 0 else cfg["max_prog_len"]
+            max_tokens = min(resolved_max_tokens, logits_seq.shape[0])
             min_tokens = max(0, min_proof_tokens)
+            domain_hint = ex.domain_tag or domain_from_tag(ex.x)
             pred_ids, decode_stats = greedy_decode_with_opcode_mask(
                 logits_seq,
                 prog_vocab,
                 enforce_opcode=constrained_op,
                 min_tokens=min_tokens,
                 max_tokens=max_tokens,
+                stop_on_emit=True,
+                domain_tag=domain_hint,
                 return_stats=True,
             )
+            pred_ids = _truncate_at_eos(pred_ids, prog_vocab)
+            pred_ids_len = len(pred_ids)
             if decode_stats.eos_pos is None:
                 stats_trunc_maxlen += 1
             else:
@@ -257,7 +289,11 @@ def main(
                 proof_tokens = [prog_vocab.decode(i) for i in pred_ids]
                 unk = sum(1 for t in proof_tokens if t == "<UNK>")
                 print(f"  proof_tokens_len={len(proof_tokens)} unk={unk}")
+                print(f"  pred_ids_len={len(pred_ids)} resolved_max_prog_len={resolved_max_tokens}")
                 print(f"  proof_tokens_head={proof_tokens[:40]}")
+                for pos, tok in enumerate(proof_tokens):
+                    if tok in ("EMIT", "EMIT_NUM", "EMIT_SCHEDULE"):
+                        stats_emit_pos[pos] = stats_emit_pos.get(pos, 0) + 1
                 ok, parse_failure, _ = scan_tokens(proof_tokens)
                 if not ok and parse_failure is not None:
                     stats_fail_pos[parse_failure.pos] = stats_fail_pos.get(parse_failure.pos, 0) + 1
@@ -265,7 +301,7 @@ def main(
                         print(f"  parse_fail_reason=INVALID_OPCODE pos={parse_failure.pos}")
                     if "<EOS>" in proof_tokens and proof_tokens.index("<EOS>") < len(proof_tokens) - 1:
                         stats_early_eos += 1
-                    if parse_failure.reason == "eof" and len(pred_ids) >= cfg["max_prog_len"]:
+                    if parse_failure.reason == "eof" and len(pred_ids) >= max_tokens:
                         stats_trunc_maxlen += 1
 
                 runtime_pred, failure = runtime_solve(ex.x, constraints, proof_tokens, return_error=True)
@@ -352,7 +388,8 @@ def main(
 
         print(
             f"[{idx}] tag={tag} snippet={snippet} y_true={_fmt_value(ex.y)} y_pred={_fmt_value(pred)} "
-            f"status={status} c_hard={c_hard:.3f} top_violations={top}"
+            f"status={status} c_hard={c_hard:.3f} top_violations={top} "
+            f"pred_ids_len={pred_ids_len} logits_len={logits_len} resolved_max_prog_len={resolved_max_tokens}"
         )
         if program is not None:
             print(f"  program={program.skeleton()}")
@@ -374,6 +411,10 @@ def main(
         ordered = sorted(stats_fail_pos.items(), key=lambda kv: kv[0])
         dist = ", ".join([f"{pos}:{count}" for pos, count in ordered[:10]])
         print(f"parse_fail_pos_top={dist}")
+    if stats_emit_pos:
+        ordered = sorted(stats_emit_pos.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        dist = ", ".join([f"{pos}:{count}" for pos, count in ordered])
+        print(f"emit_pos_top={dist}")
     if stats_eos_pos:
         ordered = sorted(stats_eos_pos.items(), key=lambda kv: kv[1], reverse=True)[:10]
         dist = ", ".join([f"{pos}:{count}" for pos, count in ordered])

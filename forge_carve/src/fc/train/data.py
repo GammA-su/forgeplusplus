@@ -47,6 +47,7 @@ class Example(BaseModel):
     y: Any
     constraints: list[ConstraintSpec] = Field(default_factory=list)
     proof: dict[str, Any]
+    program: list[str] | None = None
     proof_tokens_gold: list[str] | None = None
     orbit: list[Variant] = Field(default_factory=list)
     flips: list[Variant] = Field(default_factory=list)
@@ -813,18 +814,7 @@ def _collect_proof_tokens(
             if isinstance(tok, int):
                 decoded = vocab.decode(tok)
                 if decoded == "<UNK>":
-            missing_id_counts[tok] += 1
-
-
-def _select_proof_tokens(ex: Example | dict[str, Any], source: str) -> dict[str, Any] | None:
-    if source not in {"proof", "gold", "prefer_gold"}:
-        raise ValueError(f"Unknown proof source: {source}")
-    proof = ex.proof if isinstance(ex, Example) else ex.get("proof")
-    if source in {"gold", "prefer_gold"}:
-        gold = ex.proof_tokens_gold if isinstance(ex, Example) else ex.get("proof_tokens_gold")
-        if isinstance(gold, list) and gold:
-            return {"dsl": "PTv1", "tokens": gold}
-    return proof
+                    missing_id_counts[tok] += 1
                 else:
                     seen.add(decoded)
                 continue
@@ -846,12 +836,52 @@ def _select_proof_tokens(ex: Example | dict[str, Any], source: str) -> dict[str,
             missing_counts[tok_str] += 1
 
 
+def _select_proof_tokens(ex: Example | dict[str, Any], source: str) -> dict[str, Any] | None:
+    if source not in {"proof", "gold", "prefer_gold", "program"}:
+        raise ValueError(f"Unknown proof source: {source}")
+    if source == "program":
+        program = ex.program if isinstance(ex, Example) else ex.get("program")
+        if isinstance(program, list) and program:
+            return program_to_ptv1_stub(program)
+    proof = ex.proof if isinstance(ex, Example) else ex.get("proof")
+    if source in {"gold", "prefer_gold"}:
+        gold = ex.proof_tokens_gold if isinstance(ex, Example) else ex.get("proof_tokens_gold")
+        if isinstance(gold, list) and gold:
+            return {"dsl": "PTv1", "tokens": gold}
+    return proof
+
+
 def audit_proof_tokens(
     examples: Iterable[Example] | Iterable[dict[str, Any]],
     *,
     proof_source: str = "proof",
 ) -> list[str]:
     vocab = build_default_vocab()
+    seen: set[str] = set()
+    missing_counts: Counter[str] = Counter()
+    missing_id_counts: Counter[int] = Counter()
+    for ex in examples:
+        proof = _select_proof_tokens(ex, proof_source)
+        _collect_proof_tokens(proof, vocab, seen, missing_counts, missing_id_counts)
+    if missing_counts or missing_id_counts:
+        sample_missing = missing_counts.most_common(10)
+        sample_ids = missing_id_counts.most_common(10)
+        msg = "Unknown proof tokens detected"
+        if missing_counts:
+            msg += f" tokens={sample_missing}"
+        if missing_id_counts:
+            msg += f" token_ids={sample_ids}"
+        msg += f" missing_count={sum(missing_counts.values())} missing_id_count={sum(missing_id_counts.values())}"
+        raise ValueError(msg)
+    return sorted(seen)
+
+
+def audit_proof_tokens_against_vocab(
+    examples: Iterable[Example] | Iterable[dict[str, Any]],
+    vocab: TokenVocab,
+    *,
+    proof_source: str = "proof",
+) -> list[str]:
     seen: set[str] = set()
     missing_counts: Counter[str] = Counter()
     missing_id_counts: Counter[int] = Counter()
@@ -897,6 +927,30 @@ def program_to_proof(program: Program) -> dict[str, Any]:
     return {"dsl": "PTv1", "tokens": tokens, "sha256": _hash_tokens(tokens), "aux": {}}
 
 
+def _ensure_terminated_tokens(tokens: list[str]) -> list[str]:
+    if not tokens:
+        return tokens
+    if tokens[-1] == "<EOS>":
+        return tokens
+    if tokens[-1] == "END":
+        return tokens + ["<EOS>"]
+    return tokens + ["END", "<EOS>"]
+
+
+def program_to_ptv1_stub(program: list[str]) -> dict[str, Any]:
+    tokens = [str(tok) for tok in program]
+    if "BEGIN" in tokens:
+        if tokens[0] != "<BOS>":
+            tokens = ["<BOS>"] + tokens
+        tokens = _ensure_terminated_tokens(tokens)
+        return {"dsl": "PTv1", "tokens": tokens, "sha256": _hash_tokens(tokens), "aux": {"source": "program"}}
+    wrapped: list[str] = ["<BOS>", "BEGIN"]
+    for op in tokens:
+        wrapped.extend(["OP", op])
+    wrapped = _ensure_terminated_tokens(wrapped)
+    return {"dsl": "PTv1", "tokens": wrapped, "sha256": _hash_tokens(wrapped), "aux": {"source": "program"}}
+
+
 def proof_to_token_ids(proof: dict[str, Any], vocab: Any, strict: bool = True) -> list[int]:
     if not proof:
         return []
@@ -913,13 +967,14 @@ def proof_to_token_ids(proof: dict[str, Any], vocab: Any, strict: bool = True) -
                 if strict and tok_str not in vocab.token_to_id:
                     raise ValueError(f"Unknown proof token: {tok_str}")
                 ids.append(vocab.encode(tok_str))
-        return ids
+        return _ensure_terminated_ids(ids, vocab)
     program = Program.from_dict(proof)
     if strict:
         missing = [tok for tok in program_to_tokens(program) if tok not in vocab.token_to_id]
         if missing:
             raise ValueError(f"Unknown proof tokens: {sorted(set(missing))[:10]}")
-    return encode_program(program, vocab)
+    ids = encode_program(program, vocab)
+    return _ensure_terminated_ids(ids, vocab)
 
 
 def proof_to_program(proof: dict[str, Any], vocab: Any) -> Program:
@@ -929,6 +984,20 @@ def proof_to_program(proof: dict[str, Any], vocab: Any) -> Program:
         token_ids = proof_to_token_ids(proof, vocab)
         return decode_program(token_ids, vocab)
     return Program.from_dict(proof)
+
+
+def _ensure_terminated_ids(ids: list[int], vocab: Any) -> list[int]:
+    if not ids:
+        return ids
+    end_id = vocab.token_to_id.get("END")
+    eos_id = vocab.token_to_id.get("<EOS>")
+    if eos_id is None or end_id is None:
+        return ids
+    if ids[-1] == eos_id:
+        return ids
+    if ids[-1] == end_id:
+        return ids + [eos_id]
+    return ids + [end_id, eos_id]
 
 
 def collate_batch(

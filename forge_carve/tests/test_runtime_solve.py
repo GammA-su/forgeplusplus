@@ -23,3 +23,13 @@ def test_runtime_solve_returns_value_without_emit() -> None:
     out = runtime_solve(x, [], tokens)
     assert out is not None
     assert Fraction(out) == Fraction(7063 - 4345, 1168)
+
+
+def test_runtime_solve_reports_parse_error_details() -> None:
+    tokens = ["<BOS>", "BEGIN", "OP", "EXTRACT_INT", "DEST"]
+    _, failure = runtime_solve("[MATH] Compute: 1 + 2.", [], tokens, return_error=True)
+    assert failure is not None
+    assert failure.code == "PARSE_FAIL"
+    assert "ParseError" in failure.detail
+    assert "expected=DEST_VALUE" in failure.detail
+    assert "got=EOF" in failure.detail

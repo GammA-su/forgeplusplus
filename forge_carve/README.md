@@ -17,3 +17,16 @@ uv run python scripts/make_data_csp.py --seed 123
 uv run python scripts/train_mvp.py --config configs/train_mvp.yaml
 uv run python scripts/eval_suite.py --config configs/eval_suite.yaml
 ```
+
+Phase3 headtune with program-only supervision:
+
+```bash
+uv run python scripts/03_train_phase.py \
+  --config configs/train/phase3_headtune.yaml \
+  --data out/sbpt_mix_phase3_stepwiseheavy.jsonl \
+  --init out/sbpt_best.pt \
+  --steps 3000 \
+  --max-prog-len 256 \
+  --proof-source program \
+  --out out/ckpt_256.pt
+```

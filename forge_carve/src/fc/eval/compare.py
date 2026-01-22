@@ -22,8 +22,10 @@ from fc.train.data import Example, TextVocab
 from fc.util.jsonl import read_jsonl
 from fc.util.constrained_decode import greedy_decode_with_opcode_mask
 from fc.util.opcode_repair import repair_invalid_opcodes
+from fc.util.decode_limits import resolve_max_prog_len
+from fc.util.tags import domain_from_tag
 from fc.util.runtime_solve import runtime_solve
-from fc.util.vocab_identity import assert_vocab_match
+from fc.util.vocab_identity import assert_vocab_match, vocab_identity
 from fc.verify.mesh import VerifierMesh
 
 CONF_THRESHOLD = 0.8
@@ -39,6 +41,15 @@ def _load_text_vocab(mapping: dict[str, int]) -> TextVocab:
 def _load_prog_vocab(mapping: dict[str, int]) -> TokenVocab:
     id_to_token = {i: t for t, i in mapping.items()}
     return TokenVocab(token_to_id=mapping, id_to_token=id_to_token)
+
+
+def _truncate_at_eos(ids: list[int], vocab: TokenVocab) -> list[int]:
+    eos_id = vocab.token_to_id.get("<EOS>")
+    if eos_id is None:
+        return ids
+    if eos_id in ids:
+        return ids[: ids.index(eos_id) + 1]
+    return ids
 
 
 def _load_answer_vocab(mapping: dict[str, int]) -> AnswerVocab:
@@ -127,7 +138,7 @@ def evaluate_baseline(
     text_vocab = _load_text_vocab(ckpt["text_vocab"])
     answer_vocab = _load_answer_vocab(ckpt["answer_vocab"])
     max_text_len = cfg["train"]["max_text_len"]
-    max_answer_len = cfg.get("max_answer_len") or cfg["train"].get("max_answer_len") or cfg.get("max_prog_len", 64)
+    max_answer_len = cfg.get("max_answer_len") or cfg["train"].get("max_answer_len") or cfg.get("max_prog_len", 256)
     bcfg = BackboneConfig(vocab_size=cfg["text_vocab_size"], **cfg["backbone"])
     mcfg = BaselineConfig(
         vocab_size=cfg["text_vocab_size"],
@@ -191,7 +202,8 @@ def _predict_forge(
     repair_op: bool = False,
     constrained_op: bool = True,
     min_proof_tokens: int = 0,
-    max_proof_tokens: int | None = None,
+    max_prog_len: int | None = None,
+    domain_tag: str | None = None,
     record_decode_stats: Callable[[Any], None] | None = None,
     log_repair: Callable[[str], None] | None = None,
 ) -> tuple[Any, Any]:
@@ -199,14 +211,17 @@ def _predict_forge(
     with torch.inference_mode():
         outputs = model(input_ids)
     logits_seq = outputs["logits"][0].detach()
+    domain_hint = domain_tag or domain_from_tag(text)
     pred_ids, decode_stats = greedy_decode_with_opcode_mask(
         logits_seq,
         prog_vocab,
         enforce_opcode=constrained_op,
         min_tokens=min_proof_tokens,
-        max_tokens=max_proof_tokens,
+        max_tokens=max_prog_len,
+        domain_tag=domain_hint,
         return_stats=True,
     )
+    pred_ids = _truncate_at_eos(pred_ids, prog_vocab)
     if record_decode_stats is not None:
         record_decode_stats(decode_stats)
     program = decode_program(pred_ids, prog_vocab)
@@ -238,13 +253,26 @@ def evaluate_forge(
     repair_op: bool = False,
     constrained_op: bool = True,
     min_proof_tokens: int = 0,
-    max_proof_tokens: int | None = None,
+    max_prog_len: int | None = None,
 ) -> dict[str, float]:
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg = ckpt["config"]
     text_vocab = _load_text_vocab(ckpt["text_vocab"])
     prog_vocab_map = ckpt["prog_vocab"]
     prog_vocab = _load_prog_vocab(prog_vocab_map)
+    if "prog_vocab_sha256" in ckpt:
+        ckpt_id = vocab_identity(prog_vocab_map)
+        if ckpt["prog_vocab_sha256"] != ckpt_id.sha256:
+            raise ValueError(
+                "ckpt prog_vocab_sha256 mismatch "
+                f"expected={ckpt_id.sha256} got={ckpt['prog_vocab_sha256']}"
+            )
+    ckpt_max_prog_len = ckpt.get("max_prog_len")
+    if ckpt_max_prog_len is not None and cfg.get("max_prog_len") not in (None, ckpt_max_prog_len):
+        raise ValueError(
+            "ckpt max_prog_len mismatch "
+            f"ckpt={ckpt_max_prog_len} cfg={cfg.get('max_prog_len')}"
+        )
     prog_vocab_path = Path(ckpt_path).resolve().parent / "prog_vocab.json"
     if prog_vocab_path.exists():
         disk_map = json.loads(prog_vocab_path.read_text(encoding="utf-8"))
@@ -280,6 +308,7 @@ def evaluate_forge(
     flip_ok = []
     confs = []
     max_text_len = cfg["train"]["max_text_len"]
+    max_tokens = resolve_max_prog_len(max_prog_len, cfg, ckpt=ckpt)
     eos_pos_counts: dict[int, int] = {}
     trunc_count = 0
 
@@ -311,7 +340,8 @@ def evaluate_forge(
             repair_op=repair_op,
             constrained_op=constrained_op,
             min_proof_tokens=min_proof_tokens,
-            max_proof_tokens=max_proof_tokens,
+            max_prog_len=max_tokens,
+            domain_tag=ex.domain_tag,
             record_decode_stats=_record_decode_stats,
             log_repair=log_repair,
         )
@@ -333,7 +363,8 @@ def evaluate_forge(
                 repair_op=repair_op,
                 constrained_op=constrained_op,
                 min_proof_tokens=min_proof_tokens,
-                max_proof_tokens=max_proof_tokens,
+                max_prog_len=max_tokens,
+                domain_tag=ex.domain_tag,
                 record_decode_stats=_record_decode_stats,
                 log_repair=log_repair,
             )
@@ -355,7 +386,8 @@ def evaluate_forge(
                 repair_op=repair_op,
                 constrained_op=constrained_op,
                 min_proof_tokens=min_proof_tokens,
-                max_proof_tokens=max_proof_tokens,
+                max_prog_len=max_tokens,
+                domain_tag=ex.domain_tag,
                 record_decode_stats=_record_decode_stats,
                 log_repair=log_repair,
             )
@@ -371,7 +403,7 @@ def evaluate_forge(
             dist,
             trunc_count,
             min_proof_tokens,
-            str(max_proof_tokens),
+            str(max_tokens),
         )
     return {
         "verified_accuracy": _mean(correct),
@@ -393,7 +425,7 @@ def run_compare(
     repair_op: bool = False,
     constrained_op: bool = True,
     min_proof_tokens: int = 0,
-    max_proof_tokens: int | None = None,
+    max_prog_len: int | None = None,
 ) -> dict[str, Any]:
     examples = _load_examples(schema_path, math_path, csp_path)
     grouped = _split_by_domain(examples)
@@ -415,7 +447,7 @@ def run_compare(
             repair_op=repair_op,
             constrained_op=constrained_op,
             min_proof_tokens=min_proof_tokens,
-            max_proof_tokens=max_proof_tokens,
+            max_prog_len=max_prog_len,
         )
         report["forge"] = {
             "overall": forge_overall,
@@ -426,7 +458,7 @@ def run_compare(
                 repair_op=repair_op,
                 constrained_op=constrained_op,
                 min_proof_tokens=min_proof_tokens,
-                max_proof_tokens=max_proof_tokens,
+                max_prog_len=max_prog_len,
             ),
             "math": evaluate_forge(
                 grouped["math"],
@@ -435,7 +467,7 @@ def run_compare(
                 repair_op=repair_op,
                 constrained_op=constrained_op,
                 min_proof_tokens=min_proof_tokens,
-                max_proof_tokens=max_proof_tokens,
+                max_prog_len=max_prog_len,
             ),
             "csp": evaluate_forge(
                 grouped["csp"],
@@ -444,7 +476,7 @@ def run_compare(
                 repair_op=repair_op,
                 constrained_op=constrained_op,
                 min_proof_tokens=min_proof_tokens,
-                max_proof_tokens=max_proof_tokens,
+                max_prog_len=max_prog_len,
             ),
         }
     if ablation_ckpt:
@@ -455,7 +487,7 @@ def run_compare(
             repair_op=repair_op,
             constrained_op=constrained_op,
             min_proof_tokens=min_proof_tokens,
-            max_proof_tokens=max_proof_tokens,
+            max_prog_len=max_prog_len,
         )
         report["ablation"] = {
             "overall": ablation_overall,
@@ -466,7 +498,7 @@ def run_compare(
                 repair_op=repair_op,
                 constrained_op=constrained_op,
                 min_proof_tokens=min_proof_tokens,
-                max_proof_tokens=max_proof_tokens,
+                max_prog_len=max_prog_len,
             ),
             "math": evaluate_forge(
                 grouped["math"],
@@ -475,7 +507,7 @@ def run_compare(
                 repair_op=repair_op,
                 constrained_op=constrained_op,
                 min_proof_tokens=min_proof_tokens,
-                max_proof_tokens=max_proof_tokens,
+                max_prog_len=max_prog_len,
             ),
             "csp": evaluate_forge(
                 grouped["csp"],
@@ -484,7 +516,7 @@ def run_compare(
                 repair_op=repair_op,
                 constrained_op=constrained_op,
                 min_proof_tokens=min_proof_tokens,
-                max_proof_tokens=max_proof_tokens,
+                max_prog_len=max_prog_len,
             ),
         }
     out_path = Path(out_path)

@@ -24,7 +24,7 @@ def main(
     out_path: str = "out/report.json",
     repair_op: bool = typer.Option(False, "--repair-op"),
     constrained_op: bool = typer.Option(True, "--constrained-op/--no-constrained-op"),
-    max_proof_tokens: int = typer.Option(0, "--max-proof-tokens"),
+    max_prog_len: int = typer.Option(256, "--max-prog-len"),
     min_proof_tokens: int = typer.Option(0, "--min-proof-tokens"),
 ) -> None:
     configure_logging()
@@ -46,10 +46,10 @@ def main(
             repair_op=repair_op,
             constrained_op=constrained_op,
             min_proof_tokens=min_proof_tokens if min_proof_tokens > 0 else None,
-            max_proof_tokens=max_proof_tokens if max_proof_tokens > 0 else None,
+            max_prog_len=max_prog_len,
         )
     else:
-        max_tokens = 256 if max_proof_tokens <= 0 else max_proof_tokens
+        max_tokens = max_prog_len
         report = {
             "schema": run_eval(
                 schema_path,
@@ -59,7 +59,7 @@ def main(
                 repair_op=repair_op,
                 constrained_op=constrained_op,
                 min_proof_tokens=min_proof_tokens,
-                max_proof_tokens=max_tokens,
+                max_prog_len=max_tokens,
             ),
             "math": run_eval(
                 math_path,
@@ -69,7 +69,7 @@ def main(
                 repair_op=repair_op,
                 constrained_op=constrained_op,
                 min_proof_tokens=min_proof_tokens,
-                max_proof_tokens=max_tokens,
+                max_prog_len=max_tokens,
             ),
             "csp": run_eval(
                 csp_path,
@@ -79,7 +79,7 @@ def main(
                 repair_op=repair_op,
                 constrained_op=constrained_op,
                 min_proof_tokens=min_proof_tokens,
-                max_proof_tokens=max_tokens,
+                max_prog_len=max_tokens,
             ),
         }
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)

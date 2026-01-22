@@ -130,6 +130,13 @@ def eval_math_expression(text: str) -> Fraction | None:
     expr = _normalize_text(text)
     if not expr:
         return None
+    try:
+        tokens = _tokenize(expr)
+        if not tokens:
+            return None
+        return _parse_expr(tokens)
+    except (ValueError, ZeroDivisionError, TypeError):
+        return None
 
 
 def parse_math_expression_ast(text: str) -> dict[str, Any] | None:

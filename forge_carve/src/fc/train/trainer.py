@@ -11,6 +11,7 @@ import yaml
 from torch import nn
 
 from fc.dsl.codec import alignment_distance, decode_program
+from fc.dsl.tokens import TokenVocab
 from fc.interp.core import Interpreter
 from fc.model.backbone import BackboneConfig
 from fc.model.forge import ForgeModel, ModelConfig
@@ -20,6 +21,7 @@ from fc.train.data import (
     Example,
     TextVocab,
     audit_proof_tokens,
+    audit_proof_tokens_against_vocab,
     audit_proof_tokens_from_paths,
     build_program_vocab_from_examples,
     collate_batch,
@@ -35,7 +37,7 @@ from fc.train.losses import (
     state_progress_loss,
 )
 from fc.util.jsonl import write_jsonl
-from fc.util.vocab_identity import vocab_identity
+from fc.util.vocab_identity import assert_vocab_match, vocab_identity
 from fc.util.logging import configure_logging, get_logger
 from fc.util.seed import set_seed
 from fc.verify.mesh import VerifierMesh
@@ -81,6 +83,147 @@ def _build_model(cfg: dict[str, Any], vocab_size: int) -> ForgeModel:
     pcfg = PrimalDualConfig(**cfg["primal_dual"])
     mcfg = ModelConfig(vocab_size=vocab_size, max_prog_len=cfg["max_prog_len"], backbone=bcfg, slots=scfg, primal_dual=pcfg)
     return ForgeModel(mcfg)
+
+
+def _sync_max_prog_len(cfg: dict[str, Any], train_cfg: TrainConfig) -> None:
+    cfg["max_prog_len"] = train_cfg.max_prog_len
+
+
+def _resize_policy_head(
+    model: ForgeModel,
+    state: dict[str, torch.Tensor],
+    *,
+    old_max_prog_len: int,
+    new_max_prog_len: int,
+    vocab_size: int,
+) -> None:
+    if old_max_prog_len == new_max_prog_len:
+        return
+    weight_key = "policy.head.weight"
+    bias_key = "policy.head.bias"
+    if weight_key not in state or bias_key not in state:
+        return
+    old_weight = state[weight_key]
+    old_bias = state[bias_key]
+    expected_old = old_max_prog_len * vocab_size
+    expected_new = new_max_prog_len * vocab_size
+    if old_weight.shape[0] != expected_old or old_bias.shape[0] != expected_old:
+        raise ValueError(
+            "init_ckpt policy head shape mismatch "
+            f"expected_rows={expected_old} got_weight_rows={old_weight.shape[0]}"
+        )
+    new_weight = model.policy.head.weight.detach().clone()
+    new_bias = model.policy.head.bias.detach().clone()
+    if new_weight.shape[0] != expected_new or new_bias.shape[0] != expected_new:
+        raise ValueError(
+            "policy head resize failed "
+            f"expected_rows={expected_new} got_weight_rows={new_weight.shape[0]}"
+        )
+    copy_len = min(old_max_prog_len, new_max_prog_len) * vocab_size
+    if copy_len > 0:
+        new_weight[:copy_len] = old_weight[:copy_len]
+        new_bias[:copy_len] = old_bias[:copy_len]
+    state[weight_key] = new_weight
+    state[bias_key] = new_bias
+
+
+def _resize_positional_embeddings(
+    model: ForgeModel,
+    state: dict[str, torch.Tensor],
+    logger: Any,
+) -> None:
+    model_state = model.state_dict()
+    for key, old_weight in list(state.items()):
+        if not key.endswith("pos_emb.weight") and ".pos_emb." not in key:
+            continue
+        if key not in model_state:
+            continue
+        target_weight = model_state[key]
+        if old_weight.shape == target_weight.shape:
+            continue
+        if old_weight.ndim != 2 or target_weight.ndim != 2:
+            raise ValueError(
+                "init_ckpt pos_emb rank mismatch "
+                f"key={key} expected_rank={target_weight.ndim} got_rank={old_weight.ndim}"
+            )
+        old_len, dim = old_weight.shape
+        new_len, new_dim = target_weight.shape
+        if dim != new_dim:
+            raise ValueError(
+                "init_ckpt pos_emb dim mismatch "
+                f"key={key} expected_dim={new_dim} got_dim={dim}"
+            )
+        if new_len <= old_len:
+            new_weight = old_weight[:new_len].clone()
+            method = "truncate"
+        else:
+            new_weight = target_weight.detach().clone()
+            new_weight[:old_len] = old_weight
+            extra = torch.randn(new_len - old_len, dim, device=old_weight.device) * 0.02
+            new_weight[old_len:] = extra
+            method = "noise_init"
+        state[key] = new_weight
+        logger.warning(
+            "resized init pos_emb: key=%s old_len=%d new_len=%d method=%s",
+            key,
+            old_len,
+            new_len,
+            method,
+        )
+
+
+def _load_init_checkpoint(
+    init_ckpt: dict[str, Any],
+    init_ckpt_path: str,
+    *,
+    model: ForgeModel,
+    prog_vocab: TokenVocab,
+    cfg: dict[str, Any],
+    logger: Any,
+) -> None:
+    if "model" not in init_ckpt:
+        raise ValueError(f"init_ckpt missing model state: {init_ckpt_path}")
+    if "prog_vocab" in init_ckpt:
+        assert_vocab_match(
+            prog_vocab.token_to_id,
+            init_ckpt["prog_vocab"],
+            expected_label="train.prog_vocab",
+            actual_label=f"{init_ckpt_path}:prog_vocab",
+        )
+    if "prog_vocab_sha256" in init_ckpt:
+        current_id = vocab_identity(prog_vocab.token_to_id)
+        if init_ckpt["prog_vocab_sha256"] != current_id.sha256:
+            raise ValueError(
+                "init_ckpt prog_vocab_sha256 mismatch "
+                f"expected={current_id.sha256} got={init_ckpt['prog_vocab_sha256']}"
+            )
+    init_cfg = init_ckpt.get("config", {})
+    init_text_vocab_size = init_cfg.get("text_vocab_size")
+    if init_text_vocab_size is not None and init_text_vocab_size != cfg.get("text_vocab_size"):
+        logger.warning(
+            "init_ckpt text_vocab_size mismatch expected=%s got=%s",
+            cfg.get("text_vocab_size"),
+            init_text_vocab_size,
+        )
+    init_max_prog_len = init_ckpt.get("max_prog_len") or init_cfg.get("max_prog_len")
+    if init_max_prog_len is None:
+        init_max_prog_len = model.cfg.max_prog_len
+    state = dict(init_ckpt["model"])
+    _resize_positional_embeddings(model, state, logger)
+    _resize_policy_head(
+        model,
+        state,
+        old_max_prog_len=int(init_max_prog_len),
+        new_max_prog_len=model.cfg.max_prog_len,
+        vocab_size=model.cfg.vocab_size,
+    )
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise ValueError(
+            "init_ckpt state mismatch "
+            f"missing={missing} unexpected={unexpected}"
+        )
+    logger.info("loaded init_ckpt=%s", init_ckpt_path)
 
 
 def _apply_mode(cfg: dict[str, Any]) -> str:
@@ -136,28 +279,71 @@ def train(
     config_path: str,
     out_dir: str,
     device: str | torch.device | None = None,
+    *,
+    cfg_override: dict[str, Any] | None = None,
+    init_ckpt_path: str | None = None,
 ) -> Path:
-    cfg = load_config(config_path)
+    cfg = cfg_override if cfg_override is not None else load_config(config_path)
     mode = _apply_mode(cfg)
     weights = cfg.setdefault("weights", {})
     if "proof" not in weights and "ce" in weights:
         weights["proof"] = weights["ce"]
     train_cfg = TrainConfig(**cfg["train"])
+    _sync_max_prog_len(cfg, train_cfg)
     weight_cfg = WeightConfig(**cfg.get("weights", {}))
     set_seed(train_cfg.seed)
     configure_logging()
     logger = get_logger(__name__)
 
+    init_ckpt: dict[str, Any] | None = None
+    init_text_vocab: TextVocab | None = None
+    init_prog_vocab: TokenVocab | None = None
+    if init_ckpt_path:
+        init_ckpt = torch.load(init_ckpt_path, map_location="cpu")
+        init_text_map = init_ckpt.get("text_vocab")
+        if not isinstance(init_text_map, dict):
+            raise ValueError(f"init_ckpt missing text_vocab: {init_ckpt_path}")
+        init_text_vocab = TextVocab(
+            token_to_id=init_text_map,
+            id_to_token={i: t for t, i in init_text_map.items()},
+        )
+        init_prog_map = init_ckpt.get("prog_vocab")
+        if isinstance(init_prog_map, dict):
+            init_prog_vocab = TokenVocab(
+                token_to_id=init_prog_map,
+                id_to_token={i: t for t, i in init_prog_map.items()},
+            )
+
     texts = [ex.x for ex in examples]
     for ex in examples:
         texts.extend([o.x for o in ex.orbit])
         texts.extend([f.x for f in ex.flips])
-    text_vocab = TextVocab.build(texts)
-    audit_proof_tokens(examples, proof_source=train_cfg.proof_supervision_source)
-    prog_vocab = build_program_vocab_from_examples(
-        examples,
-        proof_source=train_cfg.proof_supervision_source,
-    )
+    dataset_text_vocab = TextVocab.build(texts)
+    if init_text_vocab is not None:
+        if dataset_text_vocab.token_to_id != init_text_vocab.token_to_id:
+            extra = sorted(set(dataset_text_vocab.token_to_id) - set(init_text_vocab.token_to_id))
+            logger.warning(
+                "dataset text_vocab differs from init_ckpt; reusing init vocab extra_tokens=%d sample=%s",
+                len(extra),
+                extra[:5],
+            )
+        text_vocab = init_text_vocab
+    else:
+        text_vocab = dataset_text_vocab
+
+    if init_prog_vocab is not None:
+        audit_proof_tokens_against_vocab(
+            examples,
+            init_prog_vocab,
+            proof_source=train_cfg.proof_supervision_source,
+        )
+        prog_vocab = init_prog_vocab
+    else:
+        audit_proof_tokens(examples, proof_source=train_cfg.proof_supervision_source)
+        prog_vocab = build_program_vocab_from_examples(
+            examples,
+            proof_source=train_cfg.proof_supervision_source,
+        )
 
     cfg["text_vocab_size"] = len(text_vocab.token_to_id)
     model = _build_model(cfg, vocab_size=len(prog_vocab.token_to_id))
@@ -172,6 +358,15 @@ def train(
     model.to(torch_device)
     model.train()
     logger.info("trainer device=%s", torch_device)
+    if init_ckpt_path:
+        _load_init_checkpoint(
+            init_ckpt if init_ckpt is not None else torch.load(init_ckpt_path, map_location="cpu"),
+            init_ckpt_path,
+            model=model,
+            prog_vocab=prog_vocab,
+            cfg=cfg,
+            logger=logger,
+        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr)
     ce_loss_fn = nn.CrossEntropyLoss(ignore_index=prog_vocab.token_to_id["<PAD>"])
@@ -318,6 +513,7 @@ def train(
         "prog_vocab": prog_vocab.token_to_id,
         "prog_vocab_sha256": prog_id.sha256,
         "prog_vocab_tokens": prog_id.tokens_by_id,
+        "max_prog_len": cfg.get("max_prog_len", train_cfg.max_prog_len),
         "config": cfg,
     }
     ckpt_path = out_path / "ckpt.pt"
@@ -336,6 +532,8 @@ def train_from_paths(
     math_path: str = "out/data/math.jsonl",
     csp_path: str = "out/data/csp.jsonl",
     device: str | torch.device | None = None,
+    *,
+    init_ckpt_path: str | None = None,
 ) -> Path:
     cfg = load_config(config_path)
     proof_source = cfg.get("train", {}).get("proof_supervision_source", "proof")
@@ -344,4 +542,44 @@ def train_from_paths(
         proof_source=proof_source,
     )
     examples = load_examples(schema_path, math_path, csp_path, include_variants=True)
-    return train(examples, config_path=config_path, out_dir=out_dir, device=device)
+    return train(
+        examples,
+        config_path=config_path,
+        out_dir=out_dir,
+        device=device,
+        init_ckpt_path=init_ckpt_path,
+    )
+
+
+def train_from_dataset(
+    config_path: str,
+    data_path: str,
+    out_dir: str,
+    device: str | torch.device | None = None,
+    *,
+    init_ckpt_path: str | None = None,
+    max_prog_len: int | None = None,
+    steps: int | None = None,
+    include_variants: bool = True,
+    proof_source: str | None = None,
+) -> Path:
+    cfg = load_config(config_path)
+    if max_prog_len is not None:
+        cfg.setdefault("train", {})["max_prog_len"] = int(max_prog_len)
+        cfg["max_prog_len"] = int(max_prog_len)
+        cfg.setdefault("eval", {}).setdefault("max_prog_len", int(max_prog_len))
+    if steps is not None:
+        cfg.setdefault("train", {})["steps"] = int(steps)
+    resolved_proof_source = proof_source or cfg.get("train", {}).get("proof_supervision_source", "proof")
+    cfg.setdefault("train", {})["proof_supervision_source"] = resolved_proof_source
+    audit_proof_tokens_from_paths([data_path], proof_source=resolved_proof_source)
+    loader = load_dataset_with_variants if include_variants else load_dataset
+    examples = loader(data_path)
+    return train(
+        examples,
+        config_path=config_path,
+        out_dir=out_dir,
+        device=device,
+        cfg_override=cfg,
+        init_ckpt_path=init_ckpt_path,
+    )

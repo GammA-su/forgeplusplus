@@ -10,35 +10,39 @@ from fc.model.forge import ForgeModel, ModelConfig
 from fc.model.primal_dual import PrimalDualConfig
 from fc.model.slots import SlotConfig
 from fc.train.data import TextVocab, generate_dataset, save_dataset
+from fc.util.vocab_identity import vocab_identity
 
 
-def _write_forge_ckpt(tmp_path: Path, texts: list[str]) -> Path:
+def _write_forge_ckpt(tmp_path: Path, texts: list[str], *, max_prog_len: int = 32) -> Path:
     text_vocab = TextVocab.build(texts)
     prog_vocab = build_default_vocab()
     cfg = {
         "text_vocab_size": len(text_vocab.token_to_id),
-        "max_prog_len": 32,
+        "max_prog_len": max_prog_len,
         "backbone": {"d_model": 16, "n_heads": 2, "n_layers": 1, "d_ff": 32, "dropout": 0.1, "max_len": 32},
         "slots": {"num_slots": 2, "d_slot": 16, "num_states": 2},
         "primal_dual": {"num_constraints": 7, "steps": 1, "d_slot": 16},
-        "train": {"max_text_len": 32},
+        "train": {"max_text_len": 32, "max_prog_len": max_prog_len},
     }
     bcfg = BackboneConfig(vocab_size=cfg["text_vocab_size"], **cfg["backbone"])
     scfg = SlotConfig(**cfg["slots"])
     pcfg = PrimalDualConfig(**cfg["primal_dual"])
     mcfg = ModelConfig(
         vocab_size=len(prog_vocab.token_to_id),
-        max_prog_len=cfg["max_prog_len"],
+        max_prog_len=max_prog_len,
         backbone=bcfg,
         slots=scfg,
         primal_dual=pcfg,
     )
     model = ForgeModel(mcfg)
+    prog_id = vocab_identity(prog_vocab.token_to_id)
     ckpt = {
         "mode": "forge",
         "model": model.state_dict(),
         "text_vocab": text_vocab.token_to_id,
         "prog_vocab": prog_vocab.token_to_id,
+        "prog_vocab_sha256": prog_id.sha256,
+        "max_prog_len": max_prog_len,
         "config": cfg,
     }
     path = tmp_path / "ckpt.pt"
@@ -55,7 +59,7 @@ def test_debug_cases_script_smoke(tmp_path: Path) -> None:
         texts.append(ex.x)
         texts.extend([o.x for o in ex.orbit])
         texts.extend([f.x for f in ex.flips])
-    ckpt_path = _write_forge_ckpt(tmp_path, texts)
+    ckpt_path = _write_forge_ckpt(tmp_path, texts, max_prog_len=128)
     script = Path(__file__).resolve().parents[1] / "scripts" / "debug_cases.py"
     result = subprocess.run(
         [
@@ -71,7 +75,9 @@ def test_debug_cases_script_smoke(tmp_path: Path) -> None:
             "2",
             "--device",
             "cpu",
-            "--constrained-op",
+            "--no-constrained-op",
+            "--max-prog-len",
+            "128",
         ],
         check=True,
         cwd=str(script.parent.parent),
@@ -79,3 +85,4 @@ def test_debug_cases_script_smoke(tmp_path: Path) -> None:
         text=True,
     )
     assert "INVALID_OPCODE" not in (result.stdout or "")
+    assert "pred_ids_len=" in (result.stdout or "")

@@ -25,7 +25,7 @@ def main(
     out: str = typer.Option("", "--out"),
     repair_op: bool = typer.Option(False, "--repair-op"),
     constrained_op: bool = typer.Option(True, "--constrained-op/--no-constrained-op"),
-    max_proof_tokens: int = typer.Option(0, "--max-proof-tokens"),
+    max_prog_len: int = typer.Option(256, "--max-prog-len"),
     min_proof_tokens: int = typer.Option(0, "--min-proof-tokens"),
 ) -> None:
     configure_logging()
@@ -41,8 +41,6 @@ def main(
         schema_path = cfg.get("schema_path", schema_path)
         math_path = cfg.get("math_path", math_path)
         csp_path = cfg.get("csp_path", csp_path)
-        if max_proof_tokens <= 0:
-            max_proof_tokens = int(cfg.get("max_proof_tokens", 0) or 0)
         if min_proof_tokens <= 0:
             min_proof_tokens = int(cfg.get("min_proof_tokens", 0) or 0)
         if not out:
@@ -57,10 +55,7 @@ def main(
         csp_path,
         out_path,
     )
-    if config:
-        max_tokens = max_proof_tokens if max_proof_tokens > 0 else None
-    else:
-        max_tokens = 256 if max_proof_tokens <= 0 else max_proof_tokens
+    max_tokens = max_prog_len
     try:
         report = run_compare(
             schema_path=schema_path,
@@ -74,7 +69,7 @@ def main(
             repair_op=repair_op,
             constrained_op=constrained_op,
             min_proof_tokens=min_proof_tokens,
-            max_proof_tokens=max_tokens,
+            max_prog_len=max_tokens,
         )
     except Exception:
         logger.exception("eval_compare failed")

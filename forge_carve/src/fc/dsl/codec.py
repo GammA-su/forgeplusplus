@@ -58,7 +58,10 @@ def encode_program(program: Program, vocab: TokenVocab) -> list[int]:
 def _parse_value(tokens: list[str], idx: int) -> tuple[Value, int]:
     tok = tokens[idx]
     if tok.startswith("INT:"):
-        return int(tok.split(":", 1)[1]), idx + 1
+        try:
+            return int(tok.split(":", 1)[1]), idx + 1
+        except ValueError:
+            return tok.split(":", 1)[1], idx + 1
     if tok.startswith("BOOL:"):
         return tok.split(":", 1)[1] == "true", idx + 1
     if tok.startswith("STR:"):

@@ -6,6 +6,7 @@ from typing import Iterable
 import torch
 
 from fc.dsl.tokens import ARG_KEYS, OPCODES, TokenVocab
+from fc.util.tags import domain_from_tag
 
 _DEST_REQUIRED = {
     "EXTRACT_INT",
@@ -32,6 +33,25 @@ _OP_REQUIRED_ARGS: dict[str, set[str]] = {
 
 _EMIT_OPS = {"EMIT", "EMIT_NUM", "EMIT_SCHEDULE"}
 _DISALLOWED_TOKENS = {"<PAD>", "<UNK>"}
+_EMIT_BY_DOMAIN = {
+    "math": "EMIT_NUM",
+    "csp": "EMIT_SCHEDULE",
+    "schema": "EMIT",
+}
+_OPCODES_BY_DOMAIN = {
+    "math": {"EXTRACT_INT", "APPLY_ARITH", "ADD", "SUB", "MUL", "DIV", "BIND", "EMIT_NUM"},
+    "schema": {"EXTRACT_STR", "EXTRACT_INT", "EMIT"},
+    "csp": {"APPLY_TOPO", "APPLY_CUMSUM", "EMIT_SCHEDULE"},
+}
+
+
+def _normalize_domain(domain_tag: str | None) -> str | None:
+    if not domain_tag:
+        return None
+    if domain_tag in _EMIT_BY_DOMAIN:
+        return domain_tag
+    tagged = domain_from_tag(domain_tag)
+    return tagged
 
 
 @dataclass
@@ -69,6 +89,7 @@ class _TokenSets:
     arg_key_map: dict[str, int]
     value_ids: list[int]
     str_ids: list[int]
+    token_id_map: dict[str, int]
 
 
 def _build_token_sets(vocab: TokenVocab) -> _TokenSets:
@@ -107,22 +128,45 @@ def _build_token_sets(vocab: TokenVocab) -> _TokenSets:
         arg_key_map=arg_key_map,
         value_ids=value_ids,
         str_ids=str_ids,
+        token_id_map=dict(vocab.token_to_id),
     )
 
 
 class _Ptv1DecodeState:
-    def __init__(self) -> None:
+    def __init__(self, domain: str | None = None) -> None:
         self.mode = "START"
         self.current_op: str | None = None
         self.missing_args: set[str] = set()
         self.dest_required = False
         self.dest_seen = False
         self.args_started = False
-        self.terminate_after_emit = False
         self.done = False
         self.value_stack: list[_ValueContext] = []
         self.arg_key: str | None = None
         self.in_value = False
+        self.domain = domain
+        self.emit_required_arg: str | None = None
+        self.emit_value_start: str | None = None
+        self.emit_force_end = False
+        self.emit_value_pending = False
+
+    def clone(self) -> "_Ptv1DecodeState":
+        clone = _Ptv1DecodeState(domain=self.domain)
+        clone.mode = self.mode
+        clone.current_op = self.current_op
+        clone.missing_args = set(self.missing_args)
+        clone.dest_required = self.dest_required
+        clone.dest_seen = self.dest_seen
+        clone.args_started = self.args_started
+        clone.done = self.done
+        clone.value_stack = [_ValueContext(kind=ctx.kind, phase=ctx.phase) for ctx in self.value_stack]
+        clone.arg_key = self.arg_key
+        clone.in_value = self.in_value
+        clone.emit_required_arg = self.emit_required_arg
+        clone.emit_value_start = self.emit_value_start
+        clone.emit_force_end = self.emit_force_end
+        clone.emit_value_pending = self.emit_value_pending
+        return clone
 
     def _allowed_structural(self, tokens: _TokenSets) -> set[int]:
         allowed: set[int] = set()
@@ -163,6 +207,11 @@ class _Ptv1DecodeState:
                 allowed.add(tokens.val_id)
             return allowed
         if self.mode == "EXPECT_ARG_OR_END":
+            if self.emit_force_end:
+                for tok_id in (tokens.end_id, tokens.eos_id):
+                    if tok_id is not None:
+                        allowed.add(tok_id)
+                return allowed
             if not self.args_started and not self.dest_seen and not self.dest_required:
                 if tokens.dest_id is not None:
                     allowed.add(tokens.dest_id)
@@ -172,9 +221,8 @@ class _Ptv1DecodeState:
                 return allowed
             if tokens.arg_id is not None:
                 allowed.add(tokens.arg_id)
-            if not self.terminate_after_emit:
-                if tokens.op_id is not None:
-                    allowed.add(tokens.op_id)
+            if tokens.op_id is not None:
+                allowed.add(tokens.op_id)
             for tok_id in (tokens.end_id, tokens.eos_id):
                 if tok_id is not None:
                     allowed.add(tok_id)
@@ -183,6 +231,10 @@ class _Ptv1DecodeState:
 
     def _allowed_value(self, tokens: _TokenSets) -> set[int]:
         allowed: set[int] = set()
+        if self.emit_value_pending and not self.value_stack and self.emit_value_start:
+            forced_id = tokens.token_id_map.get(self.emit_value_start)
+            if forced_id is not None:
+                return {forced_id}
         if not self.value_stack:
             allowed.update(tokens.value_ids)
             for tok_id in (tokens.list_start_id, tokens.dict_start_id):
@@ -277,6 +329,8 @@ class _Ptv1DecodeState:
         if self.done:
             return
         if self.in_value:
+            if self.emit_value_pending and tok == self.emit_value_start:
+                self.emit_value_pending = False
             if tok == "LIST_START":
                 self.value_stack.append(_ValueContext(kind="LIST", phase="EXPECT_VALUE_OR_END"))
                 return
@@ -326,7 +380,20 @@ class _Ptv1DecodeState:
             self.dest_seen = False
             self.args_started = False
             self.missing_args = set(_OP_REQUIRED_ARGS.get(tok, set()))
-            self.terminate_after_emit = tok in _EMIT_OPS
+            self.emit_required_arg = None
+            self.emit_value_start = None
+            self.emit_force_end = False
+            self.emit_value_pending = False
+            if self.domain == "schema" and tok == "EMIT":
+                self.missing_args = {"fields"}
+                self.emit_required_arg = "fields"
+                self.emit_value_start = "DICT_START"
+            elif self.domain == "math" and tok == "EMIT_NUM":
+                self.missing_args = {"value"}
+                self.emit_required_arg = "value"
+                self.emit_value_start = "STR:result"
+            elif self.domain == "csp" and tok == "EMIT_SCHEDULE":
+                self.emit_force_end = True
             if self.dest_required:
                 self.mode = "EXPECT_DEST"
             else:
@@ -364,11 +431,16 @@ class _Ptv1DecodeState:
             if tok == "VAL":
                 self.value_stack = []
                 self.in_value = True
+                if self.emit_value_start and (self.emit_required_arg is None or self.arg_key == self.emit_required_arg):
+                    self.emit_value_pending = True
             return
 
     def _complete_arg_value(self) -> None:
         if self.arg_key and self.arg_key in self.missing_args:
             self.missing_args.discard(self.arg_key)
+        if self.emit_required_arg and self.arg_key == self.emit_required_arg:
+            self.emit_value_start = None
+            self.emit_value_pending = False
         self.arg_key = None
         self.in_value = False
         self.mode = "EXPECT_ARG_OR_END"
@@ -382,6 +454,77 @@ def _mask_logits(row: torch.Tensor, allowed: Iterable[int]) -> torch.Tensor:
     return mask
 
 
+def _advance_parent_after_value(ctx: _ValueContext) -> None:
+    if ctx.kind == "LIST" and ctx.phase == "EXPECT_VALUE_OR_END":
+        ctx.phase = "EXPECT_SEP_OR_END"
+    elif ctx.kind == "DICT":
+        if ctx.phase == "EXPECT_KEY_OR_END":
+            ctx.phase = "EXPECT_VAL"
+        elif ctx.phase == "EXPECT_VAL":
+            ctx.phase = "EXPECT_SEP_OR_END"
+
+
+def _min_tokens_to_close_value(stack: list[_ValueContext]) -> int:
+    if not stack:
+        return 1
+    tokens = 0
+    work = [_ValueContext(kind=ctx.kind, phase=ctx.phase) for ctx in stack]
+    while work:
+        top = work[-1]
+        if top.kind == "LIST":
+            tokens += 1
+            work.pop()
+            if work:
+                _advance_parent_after_value(work[-1])
+            continue
+        if top.kind == "DICT":
+            if top.phase == "EXPECT_VAL":
+                tokens += 1
+                top.phase = "EXPECT_SEP_OR_END"
+            tokens += 1
+            work.pop()
+            if work:
+                _advance_parent_after_value(work[-1])
+            continue
+        tokens += 1
+        work.pop()
+    return tokens
+
+
+def _min_tokens_to_complete(state: _Ptv1DecodeState) -> int:
+    if state.done:
+        return 0
+    base = 0
+    if state.in_value:
+        base = _min_tokens_to_close_value(state.value_stack)
+        return base + 1
+    if state.mode in {"START", "EXPECT_OP"}:
+        return 1
+    if state.mode == "EXPECT_OPCODE":
+        return 2
+    if state.mode == "EXPECT_DEST":
+        return 3
+    if state.mode == "EXPECT_DEST_VALUE":
+        return 2
+    if state.mode == "EXPECT_ARG_KEY":
+        remaining = max(0, len(state.missing_args) - 1)
+        base = 3 + 4 * remaining
+        return base + 1
+    if state.mode == "EXPECT_VAL":
+        remaining = len(state.missing_args)
+        if state.arg_key and state.arg_key in state.missing_args:
+            remaining -= 1
+        remaining = max(0, remaining)
+        base = 2 + 4 * remaining
+        return base + 1
+    if state.mode == "EXPECT_ARG_OR_END":
+        if state.missing_args:
+            base = 4 * len(state.missing_args)
+            return base + 1
+        return 1
+    return 1
+
+
 def greedy_decode_with_opcode_mask(
     logits: torch.Tensor,
     vocab: TokenVocab,
@@ -389,6 +532,8 @@ def greedy_decode_with_opcode_mask(
     enforce_opcode: bool = False,
     min_tokens: int = 0,
     max_tokens: int | None = None,
+    stop_on_emit: bool = True,
+    domain_tag: str | None = None,
     return_stats: bool = False,
 ) -> list[int] | tuple[list[int], DecodeStats]:
     if logits.ndim != 2:
@@ -401,12 +546,27 @@ def greedy_decode_with_opcode_mask(
 
     if not enforce_opcode:
         pred = torch.argmax(logits[:max_len], dim=-1).detach().cpu().tolist()
-        for idx, tok_id in enumerate(pred):
-            tok = vocab.decode(int(tok_id))
-            if eos_pos is None and tok in ("END", "<EOS>"):
-                eos_pos = idx
-                eos_token = tok
-        decoded = [int(i) for i in pred]
+        eos_id = vocab.token_to_id.get("<EOS>")
+        end_id = vocab.token_to_id.get("END")
+        if eos_id is not None and eos_id in pred:
+            idx = pred.index(eos_id)
+            decoded = [int(i) for i in pred[: idx + 1]]
+            eos_pos = idx
+            eos_token = "<EOS>"
+        elif end_id is not None and end_id in pred:
+            idx = pred.index(end_id)
+            decoded = [int(i) for i in pred[: idx + 1]]
+            if eos_id is not None:
+                decoded.append(int(eos_id))
+                eos_pos = len(decoded) - 1
+                eos_token = "<EOS>"
+        else:
+            for idx, tok_id in enumerate(pred):
+                tok = vocab.decode(int(tok_id))
+                if eos_pos is None and tok in ("END", "<EOS>"):
+                    eos_pos = idx
+                    eos_token = tok
+            decoded = [int(i) for i in pred]
         stats = DecodeStats(
             eos_pos=eos_pos,
             eos_token=eos_token,
@@ -417,12 +577,40 @@ def greedy_decode_with_opcode_mask(
         return (decoded, stats) if return_stats else decoded
 
     tokens = _build_token_sets(vocab)
-    state = _Ptv1DecodeState()
+    domain = _normalize_domain(domain_tag)
+    emit_id_set = {vocab.token_to_id[op] for op in _EMIT_OPS if op in vocab.token_to_id}
+    allowed_emit_ids: set[int] | None = None
+    if domain in _EMIT_BY_DOMAIN:
+        allowed_emit = _EMIT_BY_DOMAIN[domain]
+        if allowed_emit in vocab.token_to_id:
+            allowed_emit_ids = {vocab.token_to_id[allowed_emit]}
+    state = _Ptv1DecodeState(domain=domain)
 
     min_tokens = max(0, int(min_tokens))
     for idx in range(max_len):
         row = logits[idx].detach()
         allowed = state.allowed_ids(tokens)
+        if state.mode == "EXPECT_OPCODE":
+            if allowed_emit_ids is not None and emit_id_set:
+                allowed = set(allowed) - (emit_id_set - allowed_emit_ids)
+            if domain in _OPCODES_BY_DOMAIN:
+                allowed_ops = _OPCODES_BY_DOMAIN[domain]
+                allowed = {tok_id for tok_id in allowed if vocab.decode(int(tok_id)) in allowed_ops}
+        remaining = max_len - idx
+        if allowed:
+            filtered: set[int] = set()
+            for tok_id in allowed:
+                probe = state.clone()
+                probe.consume(vocab.decode(int(tok_id)))
+                needed = _min_tokens_to_complete(probe)
+                if needed <= remaining - 1:
+                    filtered.add(tok_id)
+            if filtered:
+                allowed = filtered
+            elif not (state.emit_required_arg and state.missing_args):
+                fallback = {tok_id for tok_id in (tokens.end_id, tokens.eos_id) if tok_id in allowed}
+                if fallback:
+                    allowed = fallback
         if idx < min_tokens:
             if tokens.end_id in allowed:
                 allowed.discard(tokens.end_id)
@@ -443,6 +631,13 @@ def greedy_decode_with_opcode_mask(
             eos_pos = idx
             eos_token = tok
         state.consume(tok)
+        if tok == "<EOS>":
+            break
+        if tok == "END" and tokens.eos_id is not None and len(decoded) < max_len:
+            decoded.append(tokens.eos_id)
+            eos_pos = len(decoded) - 1
+            eos_token = "<EOS>"
+            break
     stats = DecodeStats(
         eos_pos=eos_pos,
         eos_token=eos_token,

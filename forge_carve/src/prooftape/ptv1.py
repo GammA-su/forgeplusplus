@@ -39,7 +39,10 @@ def _parse_value(tok: str) -> Any:
     if tok.startswith("STR:"):
         return tok[4:]
     if tok.startswith("INT:"):
-        return int(tok[4:])
+        try:
+            return int(tok[4:])
+        except ValueError:
+            return tok[4:]
     if tok.startswith("FLOAT:"):
         return _decimal_to_fraction(tok[6:])
     if tok.startswith("BOOL:"):
@@ -81,6 +84,31 @@ def _parse_value_stream(tokens: List[str], idx: int) -> Tuple[Any, int]:
                 idx += 1
         return data, idx + 1
     return _parse_value(tok), idx + 1
+
+
+def _coerce_index(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Fraction):
+        if value.denominator == 1:
+            return int(value.numerator)
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text and text.lstrip("+-").isdigit():
+            return int(text)
+        return None
+    return None
 
 
 def parse_tokens(tokens: List[str]) -> List[Instr]:
@@ -327,6 +355,16 @@ class PTv1Runtime:
         prog = parse_tokens(tokens)
         last_emit: Any = None
         last_value: Any = None
+        last_num: Any = None
+
+        def _update_last_num(val: Any) -> None:
+            nonlocal last_num
+            if isinstance(val, bool):
+                return
+            if isinstance(val, (int, float, Fraction)):
+                if isinstance(val, float) and not math.isfinite(val):
+                    return
+                last_num = val
 
         for ins in prog:
             op = ins.op
@@ -337,7 +375,7 @@ class PTv1Runtime:
                 key = args.get("key")
                 index = args.get("index")
                 stop = args.get("stop")
-                idx = int(index) if index is not None else None
+                idx = _coerce_index(index)
                 val = _extract_int(env["x"], key, idx, stop)
                 if dest is None:
                     raise ValueError("EXTRACT_INT missing DEST")
@@ -345,12 +383,13 @@ class PTv1Runtime:
                     raise ValueError("EXTRACT_INT missing value")
                 env[dest] = val
                 last_value = val
+                _update_last_num(val)
 
             elif op == "EXTRACT_FLOAT":
                 key = args.get("key")
                 index = args.get("index")
                 stop = args.get("stop")
-                idx = int(index) if index is not None else None
+                idx = _coerce_index(index)
                 val = _extract_float(env["x"], key, idx, stop)
                 if dest is None:
                     raise ValueError("EXTRACT_FLOAT missing DEST")
@@ -358,6 +397,7 @@ class PTv1Runtime:
                     raise ValueError("EXTRACT_FLOAT missing value")
                 env[dest] = val
                 last_value = val
+                _update_last_num(val)
 
             elif op == "EXTRACT_STR":
                 key = args.get("key")
@@ -408,6 +448,7 @@ class PTv1Runtime:
                     raise ValueError("APPLY_ARITH missing DEST")
                 env[dest] = r
                 last_value = r
+                _update_last_num(r)
 
             elif op == "APPLY_TOPO":
                 tasks = env.get("tasks") or {}
@@ -443,6 +484,19 @@ class PTv1Runtime:
             elif op == "EMIT_NUM":
                 vref = args.get("value")
                 v = env[vref] if isinstance(vref, str) and vref in env else vref
+                if isinstance(v, str) and v in env:
+                    v = env[v]
+                if isinstance(v, (int, float, Fraction)):
+                    if isinstance(v, float) and not math.isfinite(v):
+                        raise ValueError("EMIT_NUM missing value")
+                    if isinstance(v, Fraction) and v.denominator == 1:
+                        v = int(v.numerator)
+                elif last_num is not None:
+                    v = last_num
+                    if isinstance(v, Fraction) and v.denominator == 1:
+                        v = int(v.numerator)
+                else:
+                    raise ValueError("EMIT_NUM missing value")
                 last_emit = v
                 last_value = v
 

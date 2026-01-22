@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from prooftape.ptv1 import PTv1Runtime
+from fc.util.proof_repair import scan_tokens
 
 _RUNTIME: PTv1Runtime | None = None
 
@@ -40,6 +41,15 @@ def _classify_error(exc: Exception) -> RuntimeSolveFailure:
     return RuntimeSolveFailure(code="RUNTIME_ERROR", detail=msg)
 
 
+def _parse_failure_detail(proof_tokens: list[Any]) -> str | None:
+    tokens = [tok if isinstance(tok, str) else str(tok) for tok in proof_tokens]
+    ok, failure, _ = scan_tokens(tokens)
+    if ok or failure is None:
+        return None
+    got = failure.got_token if failure.got_token is not None else "EOF"
+    return f"ParseError pos={failure.pos} expected={failure.expected_class} got={got} reason={failure.reason}"
+
+
 def runtime_solve(
     x: str,
     constraints: Iterable[dict[str, Any]],
@@ -48,10 +58,15 @@ def runtime_solve(
     return_error: bool = False,
 ) -> Any:
     rt = _get_runtime()
+    tokens = list(proof_tokens)
     try:
-        out = rt.run(x, list(constraints), list(proof_tokens))
+        out = rt.run(x, list(constraints), tokens)
     except Exception as exc:
-        failure = _classify_error(exc)
+        parse_detail = _parse_failure_detail(tokens)
+        if parse_detail is not None:
+            failure = RuntimeSolveFailure(code="PARSE_FAIL", detail=parse_detail)
+        else:
+            failure = _classify_error(exc)
         if return_error:
             return None, failure
         return None

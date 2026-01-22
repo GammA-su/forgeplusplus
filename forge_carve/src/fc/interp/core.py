@@ -155,6 +155,40 @@ def _resolve_value(state: dict[str, Any], value: Any) -> Any:
     return value
 
 
+def _update_last_num(state: dict[str, Any], value: Any) -> None:
+    if isinstance(value, bool):
+        return
+    if isinstance(value, (int, float, Fraction)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return
+        state["_last_num"] = value
+
+
+def _coerce_index(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Fraction):
+        if value.denominator == 1:
+            return int(value.numerator)
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text and text.lstrip("+-").isdigit():
+            return int(text)
+        return None
+    return None
+
+
 def _coerce_number(value: Any) -> int | Fraction | None:
     if isinstance(value, bool):
         return None
@@ -206,19 +240,21 @@ class Interpreter:
         op = inst.opcode
         if op == "EXTRACT_INT":
             key = inst.args.get("key")
-            index = inst.args.get("index")
+            index = _coerce_index(inst.args.get("index"))
             stop = inst.args.get("stop")
             val = _extract_int(text, key, index, stop)
             if inst.dest:
                 state[inst.dest] = val
+            _update_last_num(state, val)
             return val
         if op == "EXTRACT_FLOAT":
             key = inst.args.get("key")
-            index = inst.args.get("index")
+            index = _coerce_index(inst.args.get("index"))
             stop = inst.args.get("stop")
             val = _extract_float(text, key, index, stop)
             if inst.dest:
                 state[inst.dest] = val
+            _update_last_num(state, val)
             return val
         if op == "EXTRACT_STR":
             key = inst.args.get("key")
@@ -231,6 +267,7 @@ class Interpreter:
             val = inst.args.get("value")
             if inst.dest:
                 state[inst.dest] = val
+            _update_last_num(state, val)
             return val
         if op == "APPLY_ARITH":
             aval = _coerce_number(_resolve_value(state, inst.args.get("a")))
@@ -253,6 +290,7 @@ class Interpreter:
                 res = int(res.numerator)
             if inst.dest:
                 state[inst.dest] = res
+            _update_last_num(state, res)
             return res
         if op in {"ADD", "SUB", "MUL", "DIV"}:
             a = inst.args.get("a")
@@ -273,6 +311,7 @@ class Interpreter:
                 res = int(res.numerator)
             if inst.dest:
                 state[inst.dest] = res
+            _update_last_num(state, res)
             return res
         if op == "APPLY_TOPO":
             tasks = _parse_tasks(text)
@@ -318,8 +357,17 @@ class Interpreter:
             if val is None and "result" in state:
                 val = state["result"]
             val = _resolve_value(state, val)
-            if isinstance(val, Fraction) and val.denominator == 1:
-                val = int(val.numerator)
+            if isinstance(val, (int, float, Fraction)):
+                if isinstance(val, float) and not math.isfinite(val):
+                    raise ValueError("EMIT_NUM missing value")
+                if isinstance(val, Fraction) and val.denominator == 1:
+                    val = int(val.numerator)
+            elif state.get("_last_num") is not None:
+                val = state.get("_last_num")
+                if isinstance(val, Fraction) and val.denominator == 1:
+                    val = int(val.numerator)
+            else:
+                raise ValueError("EMIT_NUM missing value")
             state["output"] = val
             return val
         if op == "EMIT_SCHEDULE":
