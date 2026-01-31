@@ -1,0 +1,40 @@
+backbone:
+  d_model: 64
+  n_heads: 2
+  n_layers: 2
+  d_ff: 128
+  dropout: 0.1
+  max_len: 128
+slots:
+  num_slots: 4
+  d_slot: 64
+  num_states: 4
+primal_dual:
+  num_constraints: 7
+  steps: 2
+  d_slot: 64
+max_prog_len: 256
+train:
+  seed: 123
+  steps: 3000
+  batch_size: 8
+  lr: 0.001
+  max_text_len: 128
+  max_prog_len: 256
+  mdl_alpha: 0.01
+  mdl_beta: 0.01
+  regret_margin: 0.1
+  causal_delta: 0.1
+  proof_supervision: true
+  proof_supervision_source: proof
+eval:
+  max_prog_len: 256
+weights:
+  ce: 0.3
+  proof: 3.0
+  kkt: 0.2
+  mdl: 0.0
+  regret: 0.0
+  orbit: 0.0
+  causal: 0.0
+  state: 0.0

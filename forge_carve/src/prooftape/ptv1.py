@@ -15,6 +15,21 @@ class Instr:
     args: Dict[str, Any]
 
 
+APPLY_ARITH_ARG_ORDER: List[str] = ["a", "b", "op"]
+ARITH_OP_STRINGS: List[str] = ["+", "-", "*", "/", "add", "sub", "mul", "div"]
+APPLY_ARITH_OP_VALUES: List[str] = list(ARITH_OP_STRINGS)
+
+
+def get_op_arg_order(op: str) -> List[str] | None:
+    if op == "APPLY_ARITH":
+        return list(APPLY_ARITH_ARG_ORDER)
+    return None
+
+
+def get_apply_arith_op_tokens() -> List[str]:
+    return [f"STR:{val}" for val in APPLY_ARITH_OP_VALUES]
+
+
 _DECIMAL_RE = re.compile(r"^\s*([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))\s*$")
 
 

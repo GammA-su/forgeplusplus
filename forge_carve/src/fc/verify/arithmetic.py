@@ -62,6 +62,18 @@ class ArithmeticVerifier:
         expr_val = eval_math_expression(text)
         if expr_val is not None:
             return expr_val
+        percent_match = re.search(
+            r"([+-]?\d+(?:\.\d+)?)\s*%\s*(?:of\s*)?([+-]?\d+(?:\.\d+)?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if percent_match:
+            try:
+                pct = Fraction(percent_match.group(1))
+                base = Fraction(percent_match.group(2))
+                return pct / 100 * base
+            except (ValueError, ZeroDivisionError):
+                pass
         nums = [int(x) for x in re.findall(r"-?\d+", text)]
         if len(nums) < 2:
             return None

@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Iterable
 
 import torch
 
 from fc.dsl.tokens import ARG_KEYS, OPCODES, TokenVocab
 from fc.util.tags import domain_from_tag
+
+try:
+    from prooftape.ptv1 import (
+        ARITH_OP_STRINGS as _PTV1_ARITH_OP_STRINGS,
+        get_apply_arith_op_tokens as _get_ptv1_apply_arith_op_tokens,
+    )
+except Exception:  # pragma: no cover - optional dependency
+    _get_ptv1_apply_arith_op_tokens = None
+    _PTV1_ARITH_OP_STRINGS = None
 
 _DEST_REQUIRED = {
     "EXTRACT_INT",
@@ -43,6 +53,7 @@ _OPCODES_BY_DOMAIN = {
     "schema": {"EXTRACT_STR", "EXTRACT_INT", "EMIT"},
     "csp": {"APPLY_TOPO", "APPLY_CUMSUM", "EMIT_SCHEDULE"},
 }
+_ARITH_OP_SUBSTRINGS = ("ADD", "SUB", "MUL", "DIV", "MOD", "POW")
 
 
 def _normalize_domain(domain_tag: str | None) -> str | None:
@@ -61,6 +72,7 @@ class DecodeStats:
     truncated: bool
     min_tokens: int
     max_tokens: int
+    apply_arith_op_fallback: int = 0
 
 
 @dataclass
@@ -149,6 +161,7 @@ class _Ptv1DecodeState:
         self.emit_value_start: str | None = None
         self.emit_force_end = False
         self.emit_value_pending = False
+        self.arg_index = -1
 
     def clone(self) -> "_Ptv1DecodeState":
         clone = _Ptv1DecodeState(domain=self.domain)
@@ -166,6 +179,7 @@ class _Ptv1DecodeState:
         clone.emit_value_start = self.emit_value_start
         clone.emit_force_end = self.emit_force_end
         clone.emit_value_pending = self.emit_value_pending
+        clone.arg_index = self.arg_index
         return clone
 
     def _allowed_structural(self, tokens: _TokenSets) -> set[int]:
@@ -379,6 +393,7 @@ class _Ptv1DecodeState:
             self.dest_required = tok in _DEST_REQUIRED
             self.dest_seen = False
             self.args_started = False
+            self.arg_index = -1
             self.missing_args = set(_OP_REQUIRED_ARGS.get(tok, set()))
             self.emit_required_arg = None
             self.emit_value_start = None
@@ -414,6 +429,7 @@ class _Ptv1DecodeState:
                 return
             if tok == "ARG":
                 self.args_started = True
+                self.arg_index += 1
                 self.mode = "EXPECT_ARG_KEY"
                 return
             if tok in ("END", "<EOS>"):
@@ -525,6 +541,57 @@ def _min_tokens_to_complete(state: _Ptv1DecodeState) -> int:
     return 1
 
 
+def _resolve_apply_arith_op_ids(tokens: _TokenSets) -> set[int]:
+    allowed: set[int] = set()
+    # Tier A: STR:<op> with op in PTv1.ARITH_OP_STRINGS
+    if _PTV1_ARITH_OP_STRINGS:
+        strict: set[int] = set()
+        for op in _PTV1_ARITH_OP_STRINGS:
+            tok_id = tokens.token_id_map.get(f"STR:{op}")
+            if tok_id is not None:
+                strict.add(tok_id)
+        if strict:
+            return strict
+    # Tier B fallback: PTv1 op tokens + substring matching
+    observed: list[str] | None = None
+    if _get_ptv1_apply_arith_op_tokens is not None:
+        try:
+            observed = list(_get_ptv1_apply_arith_op_tokens())
+        except Exception:
+            observed = None
+    if observed:
+        for tok in observed:
+            tok_id = tokens.token_id_map.get(tok)
+            if tok_id is not None:
+                allowed.add(tok_id)
+    for tok, tok_id in tokens.token_id_map.items():
+        upper = tok.upper()
+        if any(sub in upper for sub in _ARITH_OP_SUBSTRINGS):
+            allowed.add(tok_id)
+    return allowed
+
+
+def _should_mask_apply_arith_operator(toks: list[str]) -> bool:
+    if not toks:
+        return False
+    last_apply = -1
+    for idx in range(len(toks) - 1, -1, -1):
+        if toks[idx] == "APPLY_ARITH":
+            last_apply = idx
+            break
+    if last_apply < 0:
+        return False
+    for j in range(last_apply + 1, len(toks)):
+        if toks[j] == "VAL":
+            return len(toks) == j + 1
+    return False
+
+
+def _math_apply_arith_mask_enabled() -> bool:
+    flag = os.getenv("FC_MATH_APPLY_ARITH_OP_MASK", "0").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
 def greedy_decode_with_opcode_mask(
     logits: torch.Tensor,
     vocab: TokenVocab,
@@ -541,6 +608,7 @@ def greedy_decode_with_opcode_mask(
     seq_len = logits.shape[0]
     max_len = seq_len if max_tokens is None else max(1, min(seq_len, int(max_tokens)))
     decoded: list[int] = []
+    decoded_tokens: list[str] = []
     eos_pos: int | None = None
     eos_token: str | None = None
 
@@ -573,6 +641,7 @@ def greedy_decode_with_opcode_mask(
             truncated=eos_pos is None,
             min_tokens=max(0, int(min_tokens)),
             max_tokens=max_len,
+            apply_arith_op_fallback=0,
         )
         return (decoded, stats) if return_stats else decoded
 
@@ -585,11 +654,25 @@ def greedy_decode_with_opcode_mask(
         if allowed_emit in vocab.token_to_id:
             allowed_emit_ids = {vocab.token_to_id[allowed_emit]}
     state = _Ptv1DecodeState(domain=domain)
+    arith_op_ids = _resolve_apply_arith_op_ids(tokens) if domain == "math" else set()
+    apply_arith_op_fallback = 0
 
     min_tokens = max(0, int(min_tokens))
     for idx in range(max_len):
         row = logits[idx].detach()
         allowed = state.allowed_ids(tokens)
+        if (
+            domain == "math"
+            and state.in_value
+            and _math_apply_arith_mask_enabled()
+            and _should_mask_apply_arith_operator(decoded_tokens)
+        ):
+            if arith_op_ids:
+                filtered = set(allowed) & arith_op_ids
+                if filtered:
+                    allowed = filtered
+                else:
+                    apply_arith_op_fallback += 1
         if state.mode == "EXPECT_OPCODE":
             if allowed_emit_ids is not None and emit_id_set:
                 allowed = set(allowed) - (emit_id_set - allowed_emit_ids)
@@ -627,6 +710,7 @@ def greedy_decode_with_opcode_mask(
         tok_id = int(torch.argmax(row).item())
         decoded.append(tok_id)
         tok = vocab.decode(tok_id)
+        decoded_tokens.append(tok)
         if eos_pos is None and tok in ("END", "<EOS>"):
             eos_pos = idx
             eos_token = tok
@@ -644,5 +728,6 @@ def greedy_decode_with_opcode_mask(
         truncated=eos_pos is None,
         min_tokens=min_tokens,
         max_tokens=max_len,
+        apply_arith_op_fallback=apply_arith_op_fallback,
     )
     return (decoded, stats) if return_stats else decoded

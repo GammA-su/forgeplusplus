@@ -283,7 +283,12 @@ class Interpreter:
             elif op_str in {"*", "mul", "times", "x"}:
                 res = aval * bval
             elif op_str in {"/", "div", "divide"}:
-                res = aval / bval if bval != 0 else float("nan")
+                if bval == 0:
+                    res = float("nan")
+                elif isinstance(aval, (int, Fraction)) and isinstance(bval, (int, Fraction)):
+                    res = Fraction(aval, bval)
+                else:
+                    res = aval / bval
             else:
                 return None
             if isinstance(res, Fraction) and res.denominator == 1:
